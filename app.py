@@ -15,8 +15,14 @@ st.set_page_config(
 st.markdown("""
 <style>
 .block-container {padding-top: 1.2rem; max-width: 1300px;}
-.stMetric {background: #FBF9F3; border: 1px solid #DCD6C4; border-radius: 10px; padding: 10px 14px;}
-div[data-testid="stMetricLabel"] {font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #3E5066;}
+.stMetric {background: #FBF9F3 !important; border: 1px solid #DCD6C4; border-radius: 10px; padding: 10px 14px;}
+div[data-testid="stMetric"] {background: #FBF9F3 !important; border: 1px solid #DCD6C4; border-radius: 10px; padding: 10px 14px;}
+div[data-testid="stMetricLabel"] {font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #3E5066 !important;}
+div[data-testid="stMetricLabel"] p {color: #3E5066 !important;}
+div[data-testid="stMetricValue"] {color: #152B45 !important;}
+div[data-testid="stMetricValue"] div {color: #152B45 !important;}
+div[data-testid="stMetricDelta"] {color: #3F7D5C !important;}
+div[data-testid="stMetricDelta"] svg {fill: #3F7D5C !important;}
 h1, h2, h3 {color: #152B45;}
 .badge {display:inline-block; padding:2px 9px; border-radius:14px; font-size:11px; font-weight:600; font-family: monospace;}
 .badge-overdue {background:#F5E2DB; color:#BD4B2C;}
@@ -129,6 +135,21 @@ def load_data(file_path, _mtime):
     return df
 
 
+def summary_counters(view_df, full_df, label):
+    """Shows total counts for this category, plus a water/electrical split,
+    and how many remain after the filters above are applied."""
+    total_in_category = len(full_df)
+    water_n = int((full_df["meter_type"] == "Water").sum())
+    elec_n = int((full_df["meter_type"] == "Electrical").sum())
+    shown_n = len(view_df)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(f"Total {label}", total_in_category)
+    c2.metric("Water", water_n)
+    c3.metric("Electrical", elec_n)
+    c4.metric("Matching current filters", shown_n)
+
+
 def status_filters(df, key_prefix):
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -205,12 +226,16 @@ RENAME = {"stand": "Stand", "meter_type": "Type", "unit_type": "Unit type", "wbh
 
 with tab_outstanding:
     st.subheader("All outstanding meters")
-    filtered = status_filters(df[~df["installed"]], "outstanding")
+    outstanding_full = df[~df["installed"]]
+    filtered = status_filters(outstanding_full, "outstanding")
+    summary_counters(filtered, outstanding_full, "outstanding")
     show_table(filtered, COLS, RENAME, sort_col="deadline")
 
 with tab_upcoming:
     st.subheader("Due within the next 14 days")
-    filtered = status_filters(df[df["status"] == "Due soon"], "upcoming")
+    due_soon_full = df[df["status"] == "Due soon"]
+    filtered = status_filters(due_soon_full, "upcoming")
+    summary_counters(filtered, due_soon_full, "due soon")
     show_table(filtered, COLS, RENAME, sort_col="deadline")
     st.markdown("##### Further ahead")
     further = status_filters(df[(~df["installed"]) & (df["deadline"].notna()) & (df["deadline"] >= pd.Timestamp(date.today())) & (df["status"] != "Due soon")], "further")
@@ -224,7 +249,9 @@ with tab_upcoming:
 
 with tab_overdue:
     st.subheader("Behind schedule — past Snag Date 4, not yet installed")
-    filtered = status_filters(df[df["status"] == "Overdue"], "overdue")
+    overdue_full = df[df["status"] == "Overdue"]
+    filtered = status_filters(overdue_full, "overdue")
+    summary_counters(filtered, overdue_full, "overdue")
     if not filtered.empty:
         filtered = filtered.copy()
         filtered["days_overdue"] = (pd.Timestamp(date.today()) - filtered["deadline"]).dt.days
@@ -238,7 +265,9 @@ with tab_overdue:
 
 with tab_installed:
     st.subheader("Installed meters log")
-    filtered = status_filters(df[df["installed"]], "installed")
+    installed_full = df[df["installed"]]
+    filtered = status_filters(installed_full, "installed")
+    summary_counters(filtered, installed_full, "installed")
     show_table(
         filtered,
         ["stand", "meter_type", "unit_type", "wbho_section", "commission_date", "deadline", "status", "amr"],
