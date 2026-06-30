@@ -15,14 +15,28 @@ st.set_page_config(
 st.markdown("""
 <style>
 .block-container {padding-top: 1.2rem; max-width: 1300px;}
-.stMetric {background: #FBF9F3 !important; border: 1px solid #DCD6C4; border-radius: 10px; padding: 10px 14px;}
-div[data-testid="stMetric"] {background: #FBF9F3 !important; border: 1px solid #DCD6C4; border-radius: 10px; padding: 10px 14px;}
-div[data-testid="stMetricLabel"] {font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #3E5066 !important;}
-div[data-testid="stMetricLabel"] p {color: #3E5066 !important;}
-div[data-testid="stMetricValue"] {color: #152B45 !important;}
-div[data-testid="stMetricValue"] div {color: #152B45 !important;}
-div[data-testid="stMetricDelta"] {color: #3F7D5C !important;}
-div[data-testid="stMetricDelta"] svg {fill: #3F7D5C !important;}
+.stMetric, div[data-testid="stMetric"] {
+  background: #FBF9F3 !important;
+  border: 1px solid #DCD6C4;
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+div[data-testid="stMetric"] * {
+  color: #152B45 !important;
+}
+div[data-testid="stMetricLabel"], div[data-testid="stMetricLabel"] * {
+  font-size: 12px !important;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: #3E5066 !important;
+}
+div[data-testid="stMetricValue"], div[data-testid="stMetricValue"] * {
+  color: #152B45 !important;
+}
+div[data-testid="stMetricDelta"], div[data-testid="stMetricDelta"] * {
+  color: #3F7D5C !important;
+  fill: #3F7D5C !important;
+}
 h1, h2, h3 {color: #152B45;}
 .badge {display:inline-block; padding:2px 9px; border-radius:14px; font-size:11px; font-weight:600; font-family: monospace;}
 .badge-overdue {background:#F5E2DB; color:#BD4B2C;}
