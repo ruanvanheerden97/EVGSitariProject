@@ -4,6 +4,8 @@ import calendar as cal
 from datetime import datetime, date
 import glob
 import os
+import json
+import streamlit.components.v1 as components
 
 st.set_page_config(
     page_title="Sitari Evergreen — Meter Commissioning",
@@ -149,6 +151,72 @@ def load_data(file_path, _mtime):
     return df
 
 
+@st.cache_data(show_spinner=False)
+def load_kiosk_data(file_path, _mtime):
+    """Build the minisub → kiosk → meters hierarchy for the reticulation diagram."""
+    xls = pd.ExcelFile(file_path)
+
+    # --- Kiosk Plan (planned counts per kiosk) ---
+    kp = xls.parse("Kiosk Plan")
+    kp.columns = [str(c).strip() for c in kp.columns]
+    kp = kp[kp["Kiosk Number"].notna() & kp["Minisub"].notna()].copy()
+    kp["Minisub"] = kp["Minisub"].astype(int)
+    kp["MS Serial"] = kp["MS Serial"].astype(int).astype(str)
+    kp["planned"] = pd.to_numeric(kp["New planned units"], errors="coerce").fillna(0).astype(int)
+
+    # --- Elec Meters (installed counts per kiosk, stand list) ---
+    elec_name = find_sheet(xls, ["Elec Meters", "Electrical Meters"])
+    edf = xls.parse(elec_name)
+    edf.columns = [str(c).strip() for c in edf.columns]
+    edf = edf[edf["Kiosk Number"].notna()].copy()
+    edf["installed"] = edf["Meter Commission Date"].notna()
+    edf["stand_str"] = edf["Stand Number"].astype(str).str.strip()
+
+    # Aggregate per kiosk
+    kiosk_agg = edf.groupby("Kiosk Number").agg(
+        installed_count=("installed", "sum"),
+        total_count=("Stand Number", "count"),
+        stands=("stand_str", lambda x: sorted(x.tolist())),
+        installed_stands=("stand_str", lambda x: sorted(edf.loc[x.index][edf.loc[x.index, "installed"]]["stand_str"].tolist())),
+    ).reset_index()
+    kiosk_agg.columns = ["kiosk", "installed", "total", "stands", "installed_stands"]
+
+    # Merge plan vs actuals
+    merged = kp.merge(kiosk_agg, left_on="Kiosk Number", right_on="kiosk", how="left")
+    merged["installed"] = merged["installed"].fillna(0).astype(int)
+    merged["total"] = merged["total"].fillna(0).astype(int)
+    merged["planned"] = merged["planned"].astype(int)
+    merged["stands"] = merged["stands"].apply(lambda x: x if isinstance(x, list) else [])
+    merged["installed_stands"] = merged["installed_stands"].apply(lambda x: x if isinstance(x, list) else [])
+
+    # Build hierarchy: minisub → list of kiosks
+    def sort_kiosk_key(k):
+        import re
+        m = re.match(r"(\d+)EVE(\d+)", str(k))
+        return (int(m.group(2)), int(m.group(1))) if m else (99, 99)
+
+    hierarchy = {}
+    for _, row in merged.iterrows():
+        ms_id = int(row["Minisub"])
+        ms_serial = str(row["MS Serial"])
+        if ms_id not in hierarchy:
+            hierarchy[ms_id] = {"serial": ms_serial, "kiosks": []}
+        hierarchy[ms_id]["kiosks"].append({
+            "kiosk": row["Kiosk Number"],
+            "planned": int(row["planned"]),
+            "installed": int(row["installed"]),
+            "total_in_sheet": int(row["total"]),
+            "stands": row["stands"],
+            "installed_stands": row["installed_stands"],
+            "comment": str(row.get("Comments", "") or ""),
+        })
+
+    # Sort kiosks within each minisub
+    for ms_id in hierarchy:
+        hierarchy[ms_id]["kiosks"].sort(key=lambda k: sort_kiosk_key(k["kiosk"]))
+
+    return hierarchy
+
 def summary_counters(view_df, full_df, label):
     """Shows total counts for this category, plus a water/electrical split,
     and how many remain after the filters above are applied."""
@@ -231,8 +299,8 @@ c5.metric("Overdue", overdue_n, delta_color="inverse")
 st.divider()
 
 # ---------- Tabs ----------
-tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections = st.tabs(
-    ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed", "📅 Calendar", "📊 Sections"]
+tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic = st.tabs(
+    ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed", "📅 Calendar", "📊 Sections", "⚡ Reticulation"]
 )
 
 COLS = ["stand", "meter_type", "unit_type", "wbho_section", "deadline", "status"]
@@ -383,3 +451,276 @@ with tab_sections:
     )
 
 st.caption("Reads the spreadsheet pushed into this repo folder. Push an updated copy whenever meters are installed — the app picks up the most recently modified matching file automatically.")
+
+# =====================================================================
+# RETICULATION TAB — single-line diagram: Minisubs → Kiosks → Meters
+# =====================================================================
+with tab_retic:
+    st.subheader("⚡ Electrical Reticulation — Single Line Diagram")
+    st.caption("Supply → Minisub → Kiosk → Meters. Click any kiosk node to expand the stand list.")
+
+    hierarchy = load_kiosk_data(data_path, mtime)
+
+    # Summary KPIs across all kiosks
+    all_kiosks = [k for ms in hierarchy.values() for k in ms["kiosks"]]
+    total_planned = sum(k["planned"] for k in all_kiosks)
+    total_installed = sum(k["installed"] for k in all_kiosks)
+    total_outstanding = sum(max(0, k["planned"] - k["installed"]) for k in all_kiosks)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total kiosks", sum(len(ms["kiosks"]) for ms in hierarchy.values()))
+    k2.metric("Planned meter points", total_planned)
+    k3.metric("Installed", total_installed, f"{round(total_installed/total_planned*100) if total_planned else 0}%")
+    k4.metric("Outstanding", total_outstanding)
+
+    st.divider()
+
+    # Build the JSON structure to pass into the HTML diagram
+    diagram_data = []
+    for ms_id in sorted(hierarchy.keys()):
+        ms = hierarchy[ms_id]
+        ms_installed = sum(k["installed"] for k in ms["kiosks"])
+        ms_planned = sum(k["planned"] for k in ms["kiosks"])
+        diagram_data.append({
+            "ms_id": ms_id,
+            "serial": ms["serial"],
+            "ms_installed": ms_installed,
+            "ms_planned": ms_planned,
+            "kiosks": ms["kiosks"],
+        })
+
+    diagram_json = json.dumps(diagram_data)
+
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: 'IBM Plex Mono', 'Courier New', monospace; background: #0e1117; color: #e0e0e0; padding: 16px; }}
+
+  /* ---- Top bus bar ---- */
+  .supply-bus {{
+    display: flex; align-items: center; justify-content: center;
+    margin-bottom: 0;
+  }}
+  .supply-box {{
+    background: #1a2535; border: 2px solid #E69138; border-radius: 8px;
+    padding: 10px 28px; font-size: 13px; font-weight: 700;
+    color: #E69138; letter-spacing: .1em; text-transform: uppercase;
+  }}
+  .bus-line {{
+    height: 4px; background: #E69138; flex: 1; max-width: 300px;
+  }}
+
+  /* ---- Minisub row ---- */
+  .minisubs-row {{
+    display: flex; justify-content: center; gap: 32px; margin-top: 0;
+    align-items: flex-start;
+  }}
+
+  /* ---- Minisub column ---- */
+  .ms-col {{ display: flex; flex-direction: column; align-items: center; min-width: 220px; }}
+
+  .ms-vert-line {{ width: 3px; height: 32px; background: #E69138; }}
+
+  .ms-box {{
+    background: #1F3F66; border: 2px solid #5B86B3; border-radius: 10px;
+    padding: 12px 18px; text-align: center; width: 100%; cursor: default;
+    position: relative;
+  }}
+  .ms-box .ms-label {{ font-size: 12px; color: #9FB0C2; letter-spacing: .08em; margin-bottom: 4px; }}
+  .ms-box .ms-title {{ font-size: 15px; font-weight: 700; color: #FFFFFF; }}
+  .ms-box .ms-serial {{ font-size: 10px; color: #7A96B2; margin-top: 3px; }}
+  .ms-box .ms-progress {{ margin-top: 8px; }}
+  .progress-track {{ height: 5px; background: #2a3f55; border-radius: 3px; overflow: hidden; }}
+  .progress-fill {{ height: 100%; background: #3F7D5C; border-radius: 3px; transition: width .3s; }}
+  .ms-counts {{ font-size: 10px; color: #9FB0C2; margin-top: 4px; }}
+
+  /* ---- Vertical connector from MS to kiosk row ---- */
+  .kiosk-connector {{ width: 3px; height: 20px; background: #5B86B3; }}
+
+  /* ---- Horizontal kiosk bus ---- */
+  .kiosk-bus-wrap {{ position: relative; width: 100%; display: flex; justify-content: center; }}
+  .kiosk-bus {{ height: 3px; background: #5B86B3; width: calc(100% - 20px); position: absolute; top: 0; }}
+
+  /* ---- Kiosk grid ---- */
+  .kiosk-grid {{
+    display: flex; flex-direction: column; gap: 0; width: 100%;
+    margin-top: 0; padding-top: 0;
+  }}
+
+  /* ---- Single kiosk entry ---- */
+  .kiosk-entry {{ display: flex; flex-direction: column; align-items: center; width: 100%; }}
+  .kiosk-drop-line {{ width: 3px; height: 20px; background: #5B86B3; }}
+
+  .kiosk-node {{
+    width: 100%; border-radius: 8px; border: 1.5px solid #334d6e;
+    background: #131c2b; cursor: pointer; padding: 9px 12px;
+    transition: border-color .15s, background .15s;
+    position: relative;
+  }}
+  .kiosk-node:hover {{ border-color: #5B86B3; background: #1a2840; }}
+  .kiosk-node.expanded {{ border-color: #E69138; background: #1e2b3a; }}
+  .kiosk-node.all-installed {{ border-color: #3F7D5C; }}
+  .kiosk-node.overdue {{ border-color: #BD4B2C; }}
+  .kiosk-removed {{ opacity: .4; cursor: default; }}
+
+  .kiosk-header {{ display: flex; align-items: center; gap: 8px; }}
+  .kiosk-id {{ font-size: 12px; font-weight: 700; color: #c8d8eb; }}
+  .kiosk-bar-wrap {{ flex: 1; }}
+  .kiosk-mini-bar {{ height: 4px; border-radius: 2px; background: #2a3f55; overflow: hidden; }}
+  .kiosk-mini-fill {{ height: 100%; border-radius: 2px; }}
+  .kiosk-counts {{ font-size: 10px; color: #7A96B2; white-space: nowrap; }}
+  .kiosk-chevron {{ font-size: 10px; color: #5B86B3; transition: transform .2s; }}
+  .kiosk-chevron.open {{ transform: rotate(180deg); }}
+
+  /* ---- Expandable stand list ---- */
+  .kiosk-detail {{
+    display: none; width: 100%; background: #0d1520; border: 1px solid #1e3050;
+    border-top: none; border-radius: 0 0 8px 8px; padding: 8px 10px;
+    font-size: 10px;
+  }}
+  .kiosk-detail.open {{ display: block; }}
+  .stand-grid {{ display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }}
+  .stand-chip {{
+    padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600;
+    background: #3F7D5C22; color: #6eb88a; border: 1px solid #3F7D5C55;
+  }}
+  .stand-chip.pending {{
+    background: #1F3F6622; color: #7a9ec4; border: 1px solid #334d6e;
+  }}
+  .comment-tag {{ font-size: 9px; color: #7A6040; margin-top: 5px; font-style: italic; }}
+</style>
+</head>
+<body>
+
+<div class="supply-bus">
+  <div class="bus-line"></div>
+  <div class="supply-box">⚡ Utility Supply (MV)</div>
+  <div class="bus-line"></div>
+</div>
+
+<div class="minisubs-row" id="diagramRoot"></div>
+
+<script>
+const data = {diagram_json};
+
+function pct(inst, plan) {{
+  return plan > 0 ? Math.round(inst / plan * 100) : 0;
+}}
+
+function barColor(p) {{
+  if (p >= 100) return '#3F7D5C';
+  if (p >= 60) return '#5B86B3';
+  if (p >= 30) return '#E69138';
+  return '#BD4B2C';
+}}
+
+function buildDiagram() {{
+  const root = document.getElementById('diagramRoot');
+
+  data.forEach(ms => {{
+    const col = document.createElement('div');
+    col.className = 'ms-col';
+
+    // Vertical line from supply
+    const vline = document.createElement('div');
+    vline.className = 'ms-vert-line';
+    col.appendChild(vline);
+
+    // Minisub box
+    const p = pct(ms.ms_installed, ms.ms_planned);
+    const msBox = document.createElement('div');
+    msBox.className = 'ms-box';
+    msBox.innerHTML = `
+      <div class="ms-label">Minisub ${{ms.ms_id}}</div>
+      <div class="ms-title">MS-${{ms.ms_id}}</div>
+      <div class="ms-serial">Serial: ${{ms.serial}}</div>
+      <div class="ms-progress">
+        <div class="progress-track"><div class="progress-fill" style="width:${{p}}%; background:${{barColor(p)}}"></div></div>
+        <div class="ms-counts">${{ms.ms_installed}} / ${{ms.ms_planned}} installed (${{p}}%)</div>
+      </div>
+    `;
+    col.appendChild(msBox);
+
+    // Connector line down to kiosk bus
+    const conn = document.createElement('div');
+    conn.className = 'kiosk-connector';
+    col.appendChild(conn);
+
+    // Kiosk grid
+    const grid = document.createElement('div');
+    grid.className = 'kiosk-grid';
+
+    ms.kiosks.forEach(k => {{
+      const entry = document.createElement('div');
+      entry.className = 'kiosk-entry';
+
+      const dropLine = document.createElement('div');
+      dropLine.className = 'kiosk-drop-line';
+      entry.appendChild(dropLine);
+
+      const isRemoved = k.planned === 0;
+      const allInst = k.installed >= k.planned && k.planned > 0;
+      const kp = pct(k.installed, k.planned);
+
+      const node = document.createElement('div');
+      node.className = 'kiosk-node' + (isRemoved ? ' kiosk-removed' : '') + (allInst ? ' all-installed' : '');
+      node.innerHTML = `
+        <div class="kiosk-header">
+          <span class="kiosk-id">${{k.kiosk}}</span>
+          <div class="kiosk-bar-wrap">
+            <div class="kiosk-mini-bar">
+              <div class="kiosk-mini-fill" style="width:${{kp}}%; background:${{barColor(kp)}}"></div>
+            </div>
+          </div>
+          <span class="kiosk-counts">${{k.installed}}/${{k.planned}}</span>
+          ${{!isRemoved ? '<span class="kiosk-chevron" id="chev-' + k.kiosk + '">▾</span>' : ''}}
+        </div>
+        ${{isRemoved ? '<div style="font-size:9px;color:#5a4040;margin-top:3px;">Kiosk removed</div>' : ''}}
+      `;
+
+      const detail = document.createElement('div');
+      detail.className = 'kiosk-detail';
+      detail.id = 'detail-' + k.kiosk;
+
+      if (!isRemoved) {{
+        const installedSet = new Set(k.installed_stands);
+        const chipsHtml = k.stands.map(s => {{
+          const done = installedSet.has(s);
+          return `<span class="stand-chip ${{done ? '' : 'pending'}}" title="Stand ${{s}} — ${{done ? 'Installed ✅' : 'Pending ⏳'}}">${{s}}</span>`;
+        }}).join('');
+        detail.innerHTML = `
+          <div style="font-size:9px;color:#5B86B3;margin-bottom:4px;">STANDS (${{k.stands.length}} in sheet · ${{k.planned}} planned)</div>
+          <div class="stand-grid">${{chipsHtml}}</div>
+          ${{k.comment && k.comment !== 'nan' ? '<div class="comment-tag">📌 ' + k.comment + '</div>' : ''}}
+        `;
+
+        node.addEventListener('click', function() {{
+          const d = document.getElementById('detail-' + k.kiosk);
+          const chev = document.getElementById('chev-' + k.kiosk);
+          const open = d.classList.toggle('open');
+          node.classList.toggle('expanded', open);
+          if (chev) chev.classList.toggle('open', open);
+        }});
+      }}
+
+      entry.appendChild(node);
+      entry.appendChild(detail);
+      grid.appendChild(entry);
+    }});
+
+    col.appendChild(grid);
+    root.appendChild(col);
+  }});
+}}
+
+buildDiagram();
+</script>
+</body>
+</html>
+"""
+
+    components.html(html, height=900, scrolling=True)
