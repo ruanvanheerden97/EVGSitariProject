@@ -454,10 +454,12 @@ def stand_map_color(stand_str, df):
 
 
 def build_estate_map(polygons, kiosks, minisubs, df, center, show_labels=True):
-    m = folium.Map(location=center, zoom_start=17, tiles=None)
+    m = folium.Map(location=center, zoom_start=19, tiles=None,
+                   max_zoom=22, zoom_control=True)
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri World Imagery", name="Satellite", overlay=False, control=True,
+        max_zoom=22, max_native_zoom=19,
     ).add_to(m)
     folium.TileLayer(
         tiles="https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png",
@@ -523,46 +525,114 @@ def build_estate_map(polygons, kiosks, minisubs, df, center, show_labels=True):
                 ),
             ).add_to(m)
 
-    # ── Kiosk markers ─────────────────────────────────────────────────
+    # ── Build kiosk → stands lookup from elec sheet ───────────────────
+    elec_df = df[df["meter_type"] == "Electrical"].copy()
+    # We need kiosk number per stand — load from hierarchy if available,
+    # but df doesn't carry kiosk_number. We'll re-derive from stand_map_color
+    # by using the elec_df directly; kiosk info comes via load_kiosk_data
+    # which is separate. For the map we attach stands via a pre-built lookup
+    # passed in as kiosk_stands (built in the tab).
+    # kiosks list items may carry a "stands" key injected by the tab.
+
+    # ── Kiosk markers — small dot + label ────────────────────────────
     for k in kiosks:
         kname = k["name"].strip()
+        stands_list = k.get("stands", [])
+        total = len(stands_list)
+
+        # Build compact unit list for popup
+        inst_set = set(df[df["installed"] & (df["meter_type"] == "Electrical")]["stand"].tolist())
+        amr_set  = set(df[df["amr"]       & (df["meter_type"] == "Electrical")]["stand"].tolist())
+
+        chips = ""
+        for s in stands_list:
+            inst = s in inst_set
+            amr  = s in amr_set
+            if inst and amr:
+                bg, fc = "#2E7D5222", "#2E7D52"
+            elif inst:
+                bg, fc = "#E6913822", "#B96E1E"
+            else:
+                bg, fc = "#3A506822", "#7a9ec4"
+            chips += (f"<span style='display:inline-block;margin:2px;padding:1px 5px;"
+                      f"border-radius:4px;font-size:10px;font-weight:600;"
+                      f"background:{bg};color:{fc};border:1px solid {fc}55'>{s}</span>")
+
+        installed_count = sum(1 for s in stands_list if s in inst_set)
+        amr_count       = sum(1 for s in stands_list if s in amr_set)
+
+        popup_html = (
+            f"<div style='font-family:sans-serif;min-width:200px;max-width:320px'>"
+            f"<div style='font-size:14px;font-weight:700;color:#152B45;margin-bottom:4px'>"
+            f"\u26a1 Kiosk {kname}</div>"
+            f"<div style='font-size:11px;color:#555;margin-bottom:8px'>"
+            f"Meters: <b>{installed_count}/{total}</b> installed &nbsp;|&nbsp; "
+            f"AMR: <b>{amr_count}/{total}</b></div>"
+            f"<div style='font-size:9px;color:#888;margin-bottom:4px;text-transform:uppercase;"
+            f"letter-spacing:.05em'>Units fed by this kiosk</div>"
+            f"<div style='line-height:1.8'>{chips if chips else '<span style=\"color:#aaa\">No stands mapped yet</span>'}</div>"
+            f"<div style='font-size:9px;color:#aaa;margin-top:6px'>"
+            f"\u2705 installed + AMR &nbsp; \U0001f7e0 installed, AMR pending &nbsp; \U0001f535 not yet installed</div>"
+            f"</div>"
+        )
+
+        # Small circle marker + tiny label — much less cluttered than a big div
+        folium.CircleMarker(
+            location=[k["lat"], k["lon"]],
+            radius=6,
+            color="#B96E1E",
+            fill=True,
+            fill_color="#E69138",
+            fill_opacity=0.95,
+            weight=2,
+            tooltip=folium.Tooltip(
+                f"<b>\u26a1 {kname}</b> &nbsp; {installed_count}/{total} installed",
+                sticky=True
+            ),
+            popup=folium.Popup(popup_html, max_width=340),
+        ).add_to(m)
+
+        # Tiny text label above the dot
         folium.Marker(
             location=[k["lat"], k["lon"]],
             icon=folium.DivIcon(
-                html=(f"<div style='background:#E69138;color:#1a1305;font-size:9px;"
-                      f"font-weight:700;padding:3px 7px;border-radius:5px;"
-                      f"border:1.5px solid #B96E1E;white-space:nowrap;"
-                      f"box-shadow:0 2px 8px rgba(0,0,0,.6)'>\u26a1 {kname}</div>"),
-                icon_size=(80, 22), icon_anchor=(40, 11),
+                html=(f"<div style='font-size:8px;font-weight:700;color:#E69138;"
+                      f"text-shadow:0 0 3px #000,0 0 3px #000;white-space:nowrap;"
+                      f"margin-top:-18px;margin-left:8px'>{kname}</div>"),
+                icon_size=(55, 14), icon_anchor=(0, 14),
             ),
-            tooltip=folium.Tooltip(f"<b>Kiosk {kname}</b>", sticky=True),
-            popup=folium.Popup(f"<b>Kiosk {kname}</b>", max_width=180),
         ).add_to(m)
 
-    # ── Minisub markers ───────────────────────────────────────────────
+    # ── Minisub markers — small square icon ───────────────────────────
     ms_serials = {"MS1": "82929702", "MS2": "82929684", "MS3": "71205556"}
     for ms in minisubs:
         msname = ms["name"].strip()
         serial_str = ms_serials.get(msname.upper(), "")
-        serial_line = (f'<br><span style="font-size:8px;font-family:monospace;color:#7A96B2">'
-                       f'{serial_str}</span>') if serial_str else ""
-        folium.Marker(
+        folium.CircleMarker(
             location=[ms["lat"], ms["lon"]],
-            icon=folium.DivIcon(
-                html=(f"<div style='background:#1F3F66;color:#c8d8eb;font-size:10px;"
-                      f"font-weight:700;padding:5px 10px;border-radius:7px;"
-                      f"border:2px solid #5B86B3;white-space:nowrap;"
-                      f"box-shadow:0 3px 10px rgba(0,0,0,.7)'>"
-                      f"\U0001f50c {msname}{serial_line}</div>"),
-                icon_size=(120, 38), icon_anchor=(60, 19),
-            ),
+            radius=9,
+            color="#5B86B3",
+            fill=True,
+            fill_color="#1F3F66",
+            fill_opacity=0.95,
+            weight=2.5,
             tooltip=folium.Tooltip(
-                f"<b>{msname}</b>{(' \u00b7 ' + serial_str) if serial_str else ''}",
+                f"<b>\U0001f50c {msname}</b>{(' &nbsp; ' + serial_str) if serial_str else ''}",
                 sticky=True
             ),
             popup=folium.Popup(
                 f"<b>{msname}</b><br>Serial: {serial_str or '\u2014'}",
                 max_width=180
+            ),
+        ).add_to(m)
+
+        folium.Marker(
+            location=[ms["lat"], ms["lon"]],
+            icon=folium.DivIcon(
+                html=(f"<div style='font-size:9px;font-weight:700;color:#5B86B3;"
+                      f"text-shadow:0 0 3px #000,0 0 3px #000;white-space:nowrap;"
+                      f"margin-top:-20px;margin-left:12px'>{msname}</div>"),
+                icon_size=(40, 14), icon_anchor=(0, 14),
             ),
         ).add_to(m)
 
@@ -1435,11 +1505,34 @@ with tab_map:
 
             # ── Render map ──────────────────────────────────────────────
             center = kml_center(polygons, kiosks, minisubs)
+
+            # Build kiosk → list of stands from elec sheet and attach to
+            # each kiosk dict so the popup can show which units it feeds
+            elec_sheet = df[df["meter_type"] == "Electrical"]
+            # Re-load kiosk number per stand from the Excel file directly
+            try:
+                _xls = pd.ExcelFile(data_path)
+                _edf = _xls.parse("Elec Meters")
+                _edf.columns = [str(c).strip() for c in _edf.columns]
+                _edf["stand_str"] = _edf["Stand Number"].astype(str).str.strip()
+                kiosk_stands_map = (
+                    _edf.groupby("Kiosk Number")["stand_str"]
+                    .apply(lambda x: sorted(x.tolist()))
+                    .to_dict()
+                )
+            except Exception:
+                kiosk_stands_map = {}
+
+            kiosks_with_stands = [
+                {**k, "stands": kiosk_stands_map.get(k["name"].strip(), [])}
+                for k in kiosks
+            ]
+
             with st.spinner("Building map\u2026"):
                 m = build_estate_map(
                     polygons,
-                    kiosks  if show_kiosks_map else [],
-                    minisubs if show_minisubs  else [],
+                    kiosks_with_stands if show_kiosks_map else [],
+                    minisubs if show_minisubs else [],
                     map_df,
                     center,
                     show_stand_labels,
