@@ -519,9 +519,9 @@ def build_estate_map(polygons, kiosks, minisubs, df, center, show_labels=True):
             folium.Marker(
                 [clat, clon],
                 icon=folium.DivIcon(
-                    html=f"<div style='font-size:7px;font-weight:700;color:#fff;"
+                    html=f"<div style='font-size:10px;font-weight:700;color:#fff;"
                          f"text-shadow:0 0 3px #000,0 0 3px #000;line-height:1'>{stand}</div>",
-                    icon_size=(30, 12), icon_anchor=(15, 6),
+                    icon_size=(36, 14), icon_anchor=(18, 7),
                 ),
             ).add_to(m)
 
@@ -579,7 +579,7 @@ def build_estate_map(polygons, kiosks, minisubs, df, center, show_labels=True):
         # Small circle marker + tiny label — much less cluttered than a big div
         folium.CircleMarker(
             location=[k["lat"], k["lon"]],
-            radius=6,
+            radius=10,
             color="#B96E1E",
             fill=True,
             fill_color="#E69138",
@@ -596,10 +596,10 @@ def build_estate_map(polygons, kiosks, minisubs, df, center, show_labels=True):
         folium.Marker(
             location=[k["lat"], k["lon"]],
             icon=folium.DivIcon(
-                html=(f"<div style='font-size:8px;font-weight:700;color:#E69138;"
+                html=(f"<div style='font-size:10px;font-weight:700;color:#E69138;"
                       f"text-shadow:0 0 3px #000,0 0 3px #000;white-space:nowrap;"
-                      f"margin-top:-18px;margin-left:8px'>{kname}</div>"),
-                icon_size=(55, 14), icon_anchor=(0, 14),
+                      f"margin-top:-22px;margin-left:12px'>{kname}</div>"),
+                icon_size=(65, 16), icon_anchor=(0, 16),
             ),
         ).add_to(m)
 
