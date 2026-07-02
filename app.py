@@ -93,6 +93,17 @@ def load_data(file_path, _mtime):
 
     records = []
 
+    def fmt_serial(col):
+        """Convert float serials like 14558067900.0 → '14558067900', blanking NaN."""
+        def _fmt(v):
+            if pd.isna(v):
+                return ""
+            try:
+                return str(int(float(v)))
+            except (ValueError, OverflowError):
+                return str(v).strip()
+        return col.apply(_fmt)
+
     if water_name:
         wdf = xls.parse(water_name)
         wdf.columns = [str(c).strip() for c in wdf.columns]
@@ -102,7 +113,7 @@ def load_data(file_path, _mtime):
         out["wbho_section"] = coalesce_col(wdf, ["WBHO Subsection"])
         out["manufacturer"] = coalesce_col(wdf, ["Manufacturer"])
         out["model"] = coalesce_col(wdf, ["Meter Model"])
-        out["serial"] = coalesce_col(wdf, ["Meter serial number"])
+        out["serial"] = fmt_serial(coalesce_col(wdf, ["Meter serial number"]))
         out["commission_date"] = pd.to_datetime(coalesce_col(wdf, ["Meter Commissioning Date", "Meter Commission Date"]), errors="coerce")
         out["amr"] = coalesce_col(wdf, ["AMR Commissioned"]).fillna(False).astype(bool)
         out["deadline"] = pd.to_datetime(coalesce_col(wdf, ["Snag Date 4"]), errors="coerce")
@@ -119,7 +130,7 @@ def load_data(file_path, _mtime):
         out["wbho_section"] = coalesce_col(edf, ["WBHO Subsection"])
         out["manufacturer"] = coalesce_col(edf, ["Manufacturer"])
         out["model"] = coalesce_col(edf, ["Meter Model"])
-        out["serial"] = coalesce_col(edf, ["Meter Serial"])
+        out["serial"] = fmt_serial(coalesce_col(edf, ["Meter Serial"]))
         out["commission_date"] = pd.to_datetime(coalesce_col(edf, ["Meter Commission Date", "Meter Commissioning Date"]), errors="coerce")
         out["amr"] = coalesce_col(edf, ["AMR Installed"]).fillna(False).astype(bool)
         out["deadline"] = pd.to_datetime(coalesce_col(edf, ["Snag Date 4"]), errors="coerce")
@@ -173,11 +184,19 @@ def load_kiosk_data(file_path, _mtime):
     edf["amr_done"] = edf["AMR Installed"].fillna(False).astype(bool)
     edf["stand_str"] = edf["Stand Number"].astype(str).str.strip()
 
-    # Build per-stand detail lookup: stand → {installed, amr}
+    def _fmt_serial(v):
+        if pd.isna(v): return ""
+        try: return str(int(float(v)))
+        except: return str(v).strip()
+
+    edf["serial_str"] = edf["Meter Serial"].apply(_fmt_serial)
+
+    # stand → {installed, amr, serial}
     stand_detail = {
         row["stand_str"]: {
             "installed": bool(row["installed"]),
             "amr": bool(row["amr_done"]),
+            "serial": row["serial_str"],
         }
         for _, row in edf.iterrows()
     }
@@ -192,6 +211,11 @@ def load_kiosk_data(file_path, _mtime):
     def agg_amr_stands(x):
         return sorted(edf.loc[x.index][edf.loc[x.index, "amr_done"]]["stand_str"].tolist())
 
+    def agg_stand_serials(x):
+        """Return dict of stand → serial for stands that have a serial."""
+        subset = edf.loc[x.index][edf.loc[x.index, "serial_str"] != ""]
+        return {row["stand_str"]: row["serial_str"] for _, row in subset.iterrows()}
+
     kiosk_agg = edf.groupby("Kiosk Number").agg(
         installed_count=("installed", "sum"),
         amr_count=("amr_done", "sum"),
@@ -199,8 +223,9 @@ def load_kiosk_data(file_path, _mtime):
         stands=("stand_str", agg_stands),
         installed_stands=("stand_str", agg_installed_stands),
         amr_stands=("stand_str", agg_amr_stands),
+        stand_serials=("stand_str", agg_stand_serials),
     ).reset_index()
-    kiosk_agg.columns = ["kiosk", "installed", "amr_count", "total", "stands", "installed_stands", "amr_stands"]
+    kiosk_agg.columns = ["kiosk", "installed", "amr_count", "total", "stands", "installed_stands", "amr_stands", "stand_serials"]
 
     # Merge plan vs actuals
     merged = kp.merge(kiosk_agg, left_on="Kiosk Number", right_on="kiosk", how="left")
@@ -211,6 +236,7 @@ def load_kiosk_data(file_path, _mtime):
     merged["stands"] = merged["stands"].apply(lambda x: x if isinstance(x, list) else [])
     merged["installed_stands"] = merged["installed_stands"].apply(lambda x: x if isinstance(x, list) else [])
     merged["amr_stands"] = merged["amr_stands"].apply(lambda x: x if isinstance(x, list) else [])
+    merged["stand_serials"] = merged["stand_serials"].apply(lambda x: x if isinstance(x, dict) else {})
 
     # Build hierarchy: minisub → list of kiosks
     def sort_kiosk_key(k):
@@ -233,6 +259,7 @@ def load_kiosk_data(file_path, _mtime):
             "stands": row["stands"],
             "installed_stands": row["installed_stands"],
             "amr_stands": row["amr_stands"],
+            "stand_serials": row["stand_serials"],
             "comment": str(row.get("Comments", "") or ""),
         })
 
@@ -374,12 +401,29 @@ with tab_overdue:
 with tab_installed:
     st.subheader("Installed meters log")
     installed_full = df[df["installed"]]
+
+    # Serial search sits above the standard filters, prominent placement
+    serial_search = st.text_input(
+        "🔍 Search by meter serial number",
+        placeholder="Type part of a serial — e.g. 10192017",
+        key="installed_serial_search"
+    )
+
     filtered = status_filters(installed_full, "installed")
+
+    # Apply serial filter on top of section/type filters
+    if serial_search.strip():
+        filtered = filtered[filtered["serial"].str.contains(serial_search.strip(), case=False, na=False)]
+        if filtered.empty:
+            st.warning(f"No installed meter found with serial matching **{serial_search}**.")
+        else:
+            st.success(f"Found {len(filtered)} meter(s) matching serial **{serial_search}**.")
+
     summary_counters(filtered, installed_full, "installed")
     show_table(
         filtered,
-        ["stand", "meter_type", "unit_type", "wbho_section", "commission_date", "deadline", "status", "amr"],
-        {"stand": "Stand", "meter_type": "Type", "unit_type": "Unit type", "wbho_section": "Section", "commission_date": "Commissioned", "deadline": "Deadline", "status": "Status", "amr": "AMR done"},
+        ["stand", "serial", "meter_type", "unit_type", "wbho_section", "commission_date", "deadline", "status", "amr"],
+        {"stand": "Stand", "serial": "Meter serial", "meter_type": "Type", "unit_type": "Unit type", "wbho_section": "Section", "commission_date": "Commissioned", "deadline": "Deadline", "status": "Status", "amr": "AMR done"},
         sort_col="commission_date", ascending=False,
     )
 
@@ -483,9 +527,33 @@ st.caption("Reads the spreadsheet pushed into this repo folder. Push an updated 
 # =====================================================================
 with tab_retic:
     st.subheader("⚡ Electrical Reticulation — Single Line Diagram")
-    st.caption("Supply → Minisub → Kiosk → Meters. Click any kiosk node to expand the stand list.")
+    st.caption("Supply → Minisub → Kiosk → Meters. Click a kiosk to expand stands. Click a stand chip to see its meter serial.")
 
     hierarchy = load_kiosk_data(data_path, mtime)
+
+    # Serial search — highlights matching stand in diagram and shows result above
+    retic_serial = st.text_input(
+        "🔍 Search by meter serial number",
+        placeholder="Type part of a serial to highlight the matching stand",
+        key="retic_serial_search"
+    )
+
+    # Resolve serial → stand for feedback message
+    if retic_serial.strip():
+        match = df[df["installed"] & df["serial"].str.contains(retic_serial.strip(), case=False, na=False)]
+        if match.empty:
+            st.warning(f"No installed meter found with serial matching **{retic_serial}**.")
+        else:
+            for _, row in match.iterrows():
+                kiosk_info = ""
+                # Try to find its kiosk from the hierarchy
+                for ms_id, ms in hierarchy.items():
+                    for k in ms["kiosks"]:
+                        if row["stand"] in k.get("stand_serials", {}):
+                            kiosk_info = f" · Kiosk **{k['kiosk']}** (MS-{ms_id})"
+                st.success(f"Stand **{row['stand']}** · Serial `{row['serial']}` · {row['meter_type']} · {row['wbho_section']}{kiosk_info} — expand that kiosk below to see the stand highlighted.")
+
+    st.divider()
 
     # Summary KPIs across all kiosks
     all_kiosks = [k for ms in hierarchy.values() for k in ms["kiosks"]]
@@ -503,7 +571,12 @@ with tab_retic:
 
     st.divider()
 
-    # Build the JSON structure to pass into the HTML diagram
+    # Resolve which stands match the serial search so we can highlight them in JS
+    highlight_stands = []
+    if retic_serial.strip():
+        match = df[df["installed"] & df["serial"].str.contains(retic_serial.strip(), case=False, na=False)]
+        highlight_stands = match["stand"].tolist()
+
     diagram_data = []
     for ms_id in sorted(hierarchy.keys()):
         ms = hierarchy[ms_id]
@@ -520,6 +593,7 @@ with tab_retic:
         })
 
     diagram_json = json.dumps(diagram_data)
+    highlight_json = json.dumps(highlight_stands)
 
     html = f"""
 <!DOCTYPE html>
@@ -644,10 +718,31 @@ with tab_retic:
   .legend-swatch {{
     width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0;
   }}
-  .comment-tag {{ font-size: 9px; color: #7A6040; margin-top: 5px; font-style: italic; }}
+  .stand-chip.highlight {{
+    outline: 2px solid #E69138;
+    box-shadow: 0 0 6px #E6913888;
+  }}
+  /* Serial popup tooltip */
+  .serial-popup {{
+    position: fixed; z-index: 9999;
+    background: #152B45; border: 1px solid #5B86B3; border-radius: 8px;
+    padding: 10px 14px; font-size: 11px; min-width: 200px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.5);
+    display: none; pointer-events: none;
+  }}
+  .serial-popup.visible {{ display: block; }}
+  .serial-popup .sp-stand {{ font-size: 13px; font-weight: 700; color: #fff; margin-bottom: 6px; }}
+  .serial-popup .sp-row {{ display: flex; justify-content: space-between; gap: 16px; margin-bottom: 3px; }}
+  .serial-popup .sp-label {{ color: #7A96B2; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }}
+  .serial-popup .sp-val {{ color: #E0E8F0; font-family: monospace; font-size: 11px; }}
+  .serial-popup .sp-amr-ok {{ color: #6eb88a; }}
+  .serial-popup .sp-amr-miss {{ color: #d4902a; }}
+  .serial-popup .sp-pending {{ color: #7a9ec4; font-style: italic; }}
 </style>
 </head>
 <body>
+
+<div class="serial-popup" id="serialPopup"></div>
 
 <div class="legend-bar">
   <strong style="color:#9FB0C2;font-size:10px;letter-spacing:.06em;">STAND STATUS:</strong>
@@ -666,6 +761,8 @@ with tab_retic:
 
 <script>
 const data = {diagram_json};
+const highlightStands = new Set({highlight_json});
+const popup = document.getElementById('serialPopup');
 
 function pct(inst, plan) {{
   return plan > 0 ? Math.round(inst / plan * 100) : 0;
@@ -677,6 +774,32 @@ function barColor(p) {{
   if (p >= 30) return '#E69138';
   return '#BD4B2C';
 }}
+
+function showPopup(e, stand, serial, inst, amr) {{
+  const amrHtml = !inst
+    ? `<span class="sp-pending">Meter not yet installed</span>`
+    : amr
+      ? `<span class="sp-amr-ok">✓ Commissioned</span>`
+      : `<span class="sp-amr-miss">⚠ Pending</span>`;
+  const serialHtml = serial
+    ? `<span class="sp-val">${{serial}}</span>`
+    : `<span class="sp-pending">No serial recorded</span>`;
+
+  popup.innerHTML = `
+    <div class="sp-stand">Stand ${{stand}}</div>
+    <div class="sp-row"><span class="sp-label">Meter serial</span>${{serialHtml}}</div>
+    <div class="sp-row"><span class="sp-label">Meter status</span><span class="sp-val">${{inst ? 'Installed' : 'Pending'}}</span></div>
+    <div class="sp-row"><span class="sp-label">AMR</span>${{amrHtml}}</div>
+  `;
+  popup.classList.add('visible');
+  const x = Math.min(e.clientX + 12, window.innerWidth - 220);
+  const y = Math.min(e.clientY + 12, window.innerHeight - 140);
+  popup.style.left = x + 'px';
+  popup.style.top = y + 'px';
+  e.stopPropagation();
+}}
+
+document.addEventListener('click', () => popup.classList.remove('visible'));
 
 function buildDiagram() {{
   const root = document.getElementById('diagramRoot');
@@ -758,22 +881,23 @@ function buildDiagram() {{
       if (!isRemoved) {{
         const installedSet = new Set(k.installed_stands);
         const amrSet = new Set(k.amr_stands);
+        const serialMap = k.stand_serials || {{}};
         const chipsHtml = k.stands.map(s => {{
           const inst = installedSet.has(s);
           const amr = amrSet.has(s);
-          if (!inst) {{
-            return `<span class="stand-chip pending" title="Stand ${{s}} — Meter not yet installed">
-              <span class="amr-dot" style="background:#334d6e"></span>${{s}}
-            </span>`;
-          }} else if (amr) {{
-            return `<span class="stand-chip" title="Stand ${{s}} — Meter ✓ · AMR ✓">
-              <span class="amr-dot ok"></span>${{s}}
-            </span>`;
-          }} else {{
-            return `<span class="stand-chip no-amr" title="Stand ${{s}} — Meter ✓ · AMR pending">
-              <span class="amr-dot missing"></span>${{s}}
-            </span>`;
-          }}
+          const serial = serialMap[s] || '';
+          const isHighlight = highlightStands.has(s);
+          let cls = 'stand-chip pending';
+          if (inst && amr) cls = 'stand-chip';
+          else if (inst) cls = 'stand-chip no-amr';
+          if (isHighlight) cls += ' highlight';
+          const dot = inst
+            ? `<span class="amr-dot ${{amr ? 'ok' : 'missing'}}"></span>`
+            : `<span class="amr-dot" style="background:#334d6e"></span>`;
+          const title = inst
+            ? `Stand ${{s}} · Serial: ${{serial || 'not recorded'}} · AMR: ${{amr ? '✓' : 'pending'}}`
+            : `Stand ${{s}} · Meter not yet installed`;
+          return `<span class="${{cls}}" data-stand="${{s}}" data-serial="${{serial}}" data-inst="${{inst}}" data-amr="${{amr}}" title="${{title}}">${{dot}}${{s}}</span>`;
         }}).join('');
         const amrMissing = k.installed - k.amr_count;
         detail.innerHTML = `
@@ -785,6 +909,20 @@ function buildDiagram() {{
           <div class="stand-grid">${{chipsHtml}}</div>
           ${{k.comment && k.comment !== 'nan' ? '<div class="comment-tag">📌 ' + k.comment + '</div>' : ''}}
         `;
+
+        // Wire up chip click → serial popup
+        detail.querySelectorAll('.stand-chip').forEach(chip => {{
+          chip.style.cursor = 'pointer';
+          chip.addEventListener('click', function(e) {{
+            showPopup(
+              e,
+              chip.dataset.stand,
+              chip.dataset.serial,
+              chip.dataset.inst === 'True',
+              chip.dataset.amr === 'True'
+            );
+          }});
+        }});
 
         node.addEventListener('click', function() {{
           const d = document.getElementById('detail-' + k.kiosk);
@@ -806,6 +944,23 @@ function buildDiagram() {{
 }}
 
 buildDiagram();
+
+// If there are highlighted stands, auto-expand their kiosks
+if (highlightStands.size > 0) {{
+  data.forEach(ms => {{
+    ms.kiosks.forEach(k => {{
+      const hasMatch = k.stands && k.stands.some(s => highlightStands.has(s));
+      if (hasMatch) {{
+        const detail = document.getElementById('detail-' + k.kiosk);
+        const node = detail && detail.previousElementSibling;
+        const chev = document.getElementById('chev-' + k.kiosk);
+        if (detail) detail.classList.add('open');
+        if (node) node.classList.add('expanded');
+        if (chev) chev.classList.add('open');
+      }}
+    }});
+  }});
+}}
 </script>
 </body>
 </html>
