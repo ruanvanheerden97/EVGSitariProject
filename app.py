@@ -340,192 +340,229 @@ def _parse_coords(coord_str):
 
 def parse_kml(kml_bytes):
     """
-    Parse a KML file exported from Google Earth.
-    Returns:
-      polygons  — list of {name, coords [[lat,lon],...], description}
-      placemarks — list of {name, lat, lon, description}  (point placemarks = kiosks)
+    Parse KML exported from Google Earth. Recognises three folder types:
+      - FS Units / units  → stand polygons
+      - Kiosks            → kiosk point placemarks
+      - Minisubs          → minisub point placemarks
+    Returns: polygons, kiosks, minisubs
     """
+    import re as _re
     root = ET.fromstring(kml_bytes)
-    polygons, placemarks = [], []
+    polygons, kiosks, minisubs = [], [], []
 
-    def walk(node):
-        for pm in node.findall(f".//{KML_NS}Placemark"):
-            name = _kml_text(pm, "name")
-            desc = _kml_text(pm, "description")
+    def _pm_name(pm):
+        n = pm.find(f"{KML_NS}name")
+        return (n.text or "").strip() if n is not None else ""
 
-            # Polygon
-            poly = pm.find(f".//{KML_NS}Polygon")
-            if poly is not None:
-                outer = poly.find(
-                    f".//{KML_NS}outerBoundaryIs/{KML_NS}LinearRing/{KML_NS}coordinates"
-                )
-                if outer is not None and outer.text:
-                    coords = _parse_coords(outer.text)
-                    if coords:
-                        polygons.append({"name": name, "coords": coords, "description": desc})
-                continue
+    def _extract_point(pm):
+        pt = pm.find(f".//{KML_NS}Point/{KML_NS}coordinates")
+        if pt is not None and pt.text:
+            parts = pt.text.strip().split(",")
+            if len(parts) >= 2:
+                try:
+                    return float(parts[1]), float(parts[0])  # lat, lon
+                except ValueError:
+                    pass
+        return None, None
 
-            # Point (kiosk marker)
-            point = pm.find(f".//{KML_NS}Point/{KML_NS}coordinates")
-            if point is not None and point.text:
-                parts = point.text.strip().split(",")
-                if len(parts) >= 2:
-                    try:
-                        lon, lat = float(parts[0]), float(parts[1])
-                        placemarks.append({"name": name, "lat": lat, "lon": lon, "description": desc})
-                    except ValueError:
-                        pass
+    def _extract_polygon(pm):
+        outer = pm.find(
+            f".//{KML_NS}Polygon/{KML_NS}outerBoundaryIs/{KML_NS}LinearRing/{KML_NS}coordinates"
+        )
+        if outer is not None and outer.text:
+            return _parse_coords(outer.text)
+        return []
 
-    walk(root)
-    return polygons, placemarks
+    for folder in root.iter(f"{KML_NS}Folder"):
+        fn = folder.find(f"{KML_NS}name")
+        fname = (fn.text or "").strip().lower() if fn is not None else ""
+        is_units   = any(k in fname for k in ("unit", "fs unit", "house", "stand"))
+        is_kiosk   = "kiosk" in fname
+        is_minisub = any(k in fname for k in ("minisub", "mini sub", "mini-sub"))
+
+        for pm in folder.findall(f"{KML_NS}Placemark"):
+            name = _pm_name(pm)
+            has_poly  = pm.find(f".//{KML_NS}Polygon") is not None
+            has_point = pm.find(f".//{KML_NS}Point")   is not None
+
+            if has_poly and (is_units or (not is_kiosk and not is_minisub)):
+                coords = _extract_polygon(pm)
+                if coords:
+                    polygons.append({"name": name, "coords": coords})
+            elif has_point and is_minisub:
+                lat, lon = _extract_point(pm)
+                if lat is not None:
+                    minisubs.append({"name": name, "lat": lat, "lon": lon})
+            elif has_point and is_kiosk:
+                lat, lon = _extract_point(pm)
+                if lat is not None:
+                    kiosks.append({"name": name, "lat": lat, "lon": lon})
+            elif has_point and not is_units:
+                lat, lon = _extract_point(pm)
+                if lat is not None:
+                    if _re.match(r"\d+EVE\d+", name, _re.IGNORECASE):
+                        kiosks.append({"name": name, "lat": lat, "lon": lon})
+                    elif _re.match(r"MS\d*", name, _re.IGNORECASE):
+                        minisubs.append({"name": name, "lat": lat, "lon": lon})
+
+    # Last-resort fallback if no folder names matched
+    if not polygons and not kiosks and not minisubs:
+        import re as _re
+        for pm in root.iter(f"{KML_NS}Placemark"):
+            name = _pm_name(pm)
+            if pm.find(f".//{KML_NS}Polygon") is not None:
+                coords = _extract_polygon(pm)
+                if coords:
+                    polygons.append({"name": name, "coords": coords})
+            elif pm.find(f".//{KML_NS}Point") is not None:
+                lat, lon = _extract_point(pm)
+                if lat is not None:
+                    if _re.match(r"\d+EVE\d+", name, _re.IGNORECASE):
+                        kiosks.append({"name": name, "lat": lat, "lon": lon})
+                    elif _re.match(r"MS\d*", name, _re.IGNORECASE):
+                        minisubs.append({"name": name, "lat": lat, "lon": lon})
+
+    return polygons, kiosks, minisubs
 
 
 def stand_map_color(stand_str, df):
-    """Return fill colour and status label for a stand based on commissioning data."""
+    """Return (fill_color, opacity, status_label) for a stand."""
     rows = df[df["stand"] == stand_str]
     if rows.empty:
-        return "#607080", 0.35, "No data"   # dark grey – stand not in sheet
-
-    # Collect water + elec rows
-    elec = rows[rows["meter_type"] == "Electrical"]
+        return "#607080", 0.35, "No data"
+    elec  = rows[rows["meter_type"] == "Electrical"]
     water = rows[rows["meter_type"] == "Water"]
-
-    elec_inst   = elec["installed"].any()   if not elec.empty else False
-    water_inst  = water["installed"].any()  if not water.empty else False
-    elec_amr    = elec["amr"].any()         if not elec.empty else False
-    water_amr   = water["amr"].any()        if not water.empty else False
-
-    # Overdue: any uninstalled row past deadline
-    overdue = rows[~rows["installed"] & rows["deadline"].notna() &
-                   (rows["deadline"] < pd.Timestamp(date.today()))]
+    elec_inst  = bool(elec["installed"].any())  if not elec.empty  else False
+    water_inst = bool(water["installed"].any()) if not water.empty else False
+    elec_amr   = bool(elec["amr"].any())        if not elec.empty  else False
+    water_amr  = bool(water["amr"].any())       if not water.empty else False
+    today = pd.Timestamp(date.today())
+    overdue  = rows[~rows["installed"] & rows["deadline"].notna() & (rows["deadline"] < today)]
     due_soon = rows[~rows["installed"] & rows["deadline"].notna() &
-                    ((rows["deadline"] - pd.Timestamp(date.today())).dt.days <= 14) &
-                    ((rows["deadline"] - pd.Timestamp(date.today())).dt.days >= 0)]
-
-    both_inst = elec_inst and water_inst
-    both_amr  = elec_amr and water_amr
-
-    if both_inst and both_amr:
-        return "#2E7D52", 0.75, "Meter ✓ · AMR ✓"           # deep green
-    if both_inst and not both_amr:
-        return "#E69138", 0.75, "Meter ✓ · AMR pending"      # amber
-    if (elec_inst or water_inst) and not (elec_inst and water_inst):
-        return "#5B86B3", 0.70, "Partially installed"         # blue
+                    ((rows["deadline"] - today).dt.days.between(0, 14))]
+    if elec_inst and water_inst and elec_amr and water_amr:
+        return "#2E7D52", 0.80, "Meter \u2713 \u00b7 AMR \u2713"
+    if elec_inst and water_inst:
+        return "#E69138", 0.80, "Meters \u2713 \u00b7 AMR pending"
+    if elec_inst or water_inst:
+        return "#5B86B3", 0.75, "Partially installed"
     if not overdue.empty:
-        return "#BD4B2C", 0.80, "Overdue"                     # red
+        return "#BD4B2C", 0.85, "Overdue"
     if not due_soon.empty:
-        return "#D4AC0D", 0.70, "Due soon"                    # yellow
-    return "#3A5068", 0.50, "On track – not yet due"          # dark blue
+        return "#D4AC0D", 0.80, "Due soon"
+    return "#3A5068", 0.55, "On track"
 
 
-def build_estate_map(polygons, placemarks, df, center):
-    m = folium.Map(
-        location=center,
-        zoom_start=17,
-        tiles=None,
-    )
-
-    # Satellite tile layer
+def build_estate_map(polygons, kiosks, minisubs, df, center, show_labels=True):
+    m = folium.Map(location=center, zoom_start=17, tiles=None)
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri World Imagery",
-        name="Satellite",
-        overlay=False,
-        control=True,
+        attr="Esri World Imagery", name="Satellite", overlay=False, control=True,
     ).add_to(m)
-
-    # Streets overlay for orientation
     folium.TileLayer(
         tiles="https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png",
-        attr="© OpenStreetMap, © CARTO",
-        name="Labels",
-        overlay=True,
-        control=True,
-        opacity=0.6,
+        attr="(c) OpenStreetMap (c) CARTO", name="Labels",
+        overlay=True, control=True, opacity=0.7,
     ).add_to(m)
 
-    # ── House polygons ────────────────────────────────────────────────
+    # ── Unit polygons ─────────────────────────────────────────────────
     for poly in polygons:
         stand = poly["name"].strip()
         color, opacity, status_label = stand_map_color(stand, df)
         rows = df[df["stand"] == stand]
-
-        # Build popup HTML
-        elec = rows[rows["meter_type"] == "Electrical"]
+        elec  = rows[rows["meter_type"] == "Electrical"]
         water = rows[rows["meter_type"] == "Water"]
 
-        def row_html(r_df, label):
+        def _row(r_df, label):
             if r_df.empty:
-                return f"<tr><td><b>{label}</b></td><td colspan='2' style='color:#999'>Not in sheet</td></tr>"
+                return f"<tr><td colspan='3' style='color:#aaa;padding:4px 0'><b>{label}:</b> not in sheet</td></tr>"
             r = r_df.iloc[0]
-            serial = r["serial"] if r["serial"] else "—"
-            inst = "✅ " + r["commission_date"].strftime("%d %b %Y") if r["installed"] and pd.notna(r["commission_date"]) else "⏳ Pending"
-            amr = "✅ Yes" if r["amr"] else "⏳ No"
-            dl = r["deadline"].strftime("%d %b %Y") if pd.notna(r["deadline"]) else "—"
+            serial = r["serial"] if r["serial"] else "\u2014"
+            inst   = ("\u2705 " + r["commission_date"].strftime("%d %b %Y")
+                      if r["installed"] and pd.notna(r["commission_date"]) else "\u23f3 Pending")
+            amr_s  = "\u2705" if r["amr"] else "\u23f3"
+            dl     = r["deadline"].strftime("%d %b %Y") if pd.notna(r["deadline"]) else "\u2014"
             return (
-                f"<tr><td><b>{label}</b></td><td>{inst}</td><td>AMR: {amr}</td></tr>"
-                f"<tr><td style='color:#888;font-size:10px'>Serial</td><td colspan='2' style='font-family:monospace'>{serial}</td></tr>"
-                f"<tr><td style='color:#888;font-size:10px'>Deadline</td><td colspan='2'>{dl}</td></tr>"
+                f"<tr><td style='padding:3px 6px 1px;font-weight:700'>{label}</td>"
+                f"<td style='padding:3px 6px 1px'>{inst}</td>"
+                f"<td style='padding:3px 6px 1px'>AMR {amr_s}</td></tr>"
+                f"<tr><td style='padding:1px 6px 4px;font-size:10px;color:#777'>Serial</td>"
+                f"<td style='padding:1px 6px 4px;font-family:monospace;font-size:10px' colspan='2'>{serial}</td></tr>"
+                f"<tr><td style='padding:1px 6px 6px;font-size:10px;color:#777'>Deadline</td>"
+                f"<td style='padding:1px 6px 6px;font-size:10px' colspan='2'>{dl}</td></tr>"
             )
 
-        popup_html = f"""
-        <div style='font-family:sans-serif;min-width:220px;'>
-          <div style='font-size:14px;font-weight:700;margin-bottom:8px;color:#152B45'>Stand {stand}</div>
-          <div style='display:inline-block;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:600;
-               background:{color}22;color:{color};border:1px solid {color}66;margin-bottom:8px'>{status_label}</div>
-          <table style='width:100%;font-size:12px;border-collapse:collapse'>
-            {row_html(elec, "Electrical")}
-            {row_html(water, "Water")}
-          </table>
-        </div>"""
+        popup_html = (
+            f"<div style='font-family:sans-serif;min-width:240px;max-width:300px'>"
+            f"<div style='font-size:15px;font-weight:700;color:#152B45;margin-bottom:6px'>Stand {stand}</div>"
+            f"<div style='display:inline-block;padding:2px 10px;border-radius:10px;font-size:11px;"
+            f"font-weight:600;background:{color}22;color:{color};border:1px solid {color}88;"
+            f"margin-bottom:8px'>{status_label}</div>"
+            f"<table style='width:100%;font-size:12px;border-collapse:collapse;border-top:1px solid #eee'>"
+            f"{_row(elec,'Electrical')}{_row(water,'Water')}"
+            f"</table></div>"
+        )
 
         folium.Polygon(
             locations=poly["coords"],
-            color=color,
-            weight=1.5,
-            fill=True,
-            fill_color=color,
-            fill_opacity=opacity,
-            tooltip=f"Stand {stand} — {status_label}",
-            popup=folium.Popup(popup_html, max_width=280),
+            color=color, weight=1.5,
+            fill=True, fill_color=color, fill_opacity=opacity,
+            tooltip=folium.Tooltip(f"<b>Stand {stand}</b><br>{status_label}", sticky=True),
+            popup=folium.Popup(popup_html, max_width=300),
         ).add_to(m)
 
-        # Stand number label at centroid
-        if poly["coords"]:
+        if show_labels and poly["coords"]:
             clat = sum(c[0] for c in poly["coords"]) / len(poly["coords"])
             clon = sum(c[1] for c in poly["coords"]) / len(poly["coords"])
             folium.Marker(
                 [clat, clon],
                 icon=folium.DivIcon(
-                    html=f"<div style='font-size:7px;font-weight:700;color:#fff;text-shadow:0 0 2px #000;'>{stand}</div>",
-                    icon_size=(28, 12),
-                    icon_anchor=(14, 6),
+                    html=f"<div style='font-size:7px;font-weight:700;color:#fff;"
+                         f"text-shadow:0 0 3px #000,0 0 3px #000;line-height:1'>{stand}</div>",
+                    icon_size=(30, 12), icon_anchor=(15, 6),
                 ),
             ).add_to(m)
 
-    # ── Kiosk placemarks ─────────────────────────────────────────────
-    for pm in placemarks:
-        kname = pm["name"].strip()
-        # Count installed vs planned for this kiosk from df
-        kiosk_rows = df[(df["meter_type"] == "Electrical") &
-                        df.get("kiosk_number", pd.Series(dtype=str)).eq(kname)
-                        if "kiosk_number" in df.columns else pd.Series([False]*len(df))]
-
+    # ── Kiosk markers ─────────────────────────────────────────────────
+    for k in kiosks:
+        kname = k["name"].strip()
         folium.Marker(
-            location=[pm["lat"], pm["lon"]],
+            location=[k["lat"], k["lon"]],
             icon=folium.DivIcon(
-                html=f"""<div style='
-                    background:#E69138;color:#1a1305;font-size:9px;font-weight:700;
-                    padding:3px 6px;border-radius:5px;border:1px solid #B96E1E;
-                    white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,.5);
-                '>⚡ {kname}</div>""",
-                icon_size=(70, 22),
-                icon_anchor=(35, 11),
+                html=(f"<div style='background:#E69138;color:#1a1305;font-size:9px;"
+                      f"font-weight:700;padding:3px 7px;border-radius:5px;"
+                      f"border:1.5px solid #B96E1E;white-space:nowrap;"
+                      f"box-shadow:0 2px 8px rgba(0,0,0,.6)'>\u26a1 {kname}</div>"),
+                icon_size=(80, 22), icon_anchor=(40, 11),
             ),
-            tooltip=kname,
+            tooltip=folium.Tooltip(f"<b>Kiosk {kname}</b>", sticky=True),
+            popup=folium.Popup(f"<b>Kiosk {kname}</b>", max_width=180),
+        ).add_to(m)
+
+    # ── Minisub markers ───────────────────────────────────────────────
+    ms_serials = {"MS1": "82929702", "MS2": "82929684", "MS3": "71205556"}
+    for ms in minisubs:
+        msname = ms["name"].strip()
+        serial_str = ms_serials.get(msname.upper(), "")
+        serial_line = (f'<br><span style="font-size:8px;font-family:monospace;color:#7A96B2">'
+                       f'{serial_str}</span>') if serial_str else ""
+        folium.Marker(
+            location=[ms["lat"], ms["lon"]],
+            icon=folium.DivIcon(
+                html=(f"<div style='background:#1F3F66;color:#c8d8eb;font-size:10px;"
+                      f"font-weight:700;padding:5px 10px;border-radius:7px;"
+                      f"border:2px solid #5B86B3;white-space:nowrap;"
+                      f"box-shadow:0 3px 10px rgba(0,0,0,.7)'>"
+                      f"\U0001f50c {msname}{serial_line}</div>"),
+                icon_size=(120, 38), icon_anchor=(60, 19),
+            ),
+            tooltip=folium.Tooltip(
+                f"<b>{msname}</b>{(' \u00b7 ' + serial_str) if serial_str else ''}",
+                sticky=True
+            ),
             popup=folium.Popup(
-                f"<b>Kiosk {kname}</b><br>{pm['description'] or ''}",
-                max_width=200
+                f"<b>{msname}</b><br>Serial: {serial_str or '\u2014'}",
+                max_width=180
             ),
         ).add_to(m)
 
@@ -533,17 +570,18 @@ def build_estate_map(polygons, placemarks, df, center):
     return m
 
 
-def kml_center(polygons, placemarks):
+def kml_center(polygons, kiosks, minisubs):
     """Compute map center from all coordinates."""
     all_lats, all_lons = [], []
     for p in polygons:
         for lat, lon in p["coords"]:
             all_lats.append(lat); all_lons.append(lon)
-    for p in placemarks:
-        all_lats.append(p["lat"]); all_lons.append(p["lon"])
+    for items in (kiosks, minisubs):
+        for p in items:
+            all_lats.append(p["lat"]); all_lons.append(p["lon"])
     if all_lats:
         return [sum(all_lats)/len(all_lats), sum(all_lons)/len(all_lons)]
-    return [-25.7, 28.2]   # fallback: Pretoria area
+    return [-34.054, 18.778]   # Sitari estate fallback
 
 
 def summary_counters(view_df, full_df, label):
