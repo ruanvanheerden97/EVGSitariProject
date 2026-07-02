@@ -590,7 +590,15 @@ def show_table(view_df, columns, rename, sort_col=None, ascending=True):
             show[c] = show[c].dt.strftime("%d %b %Y")
     st.dataframe(show, use_container_width=True, hide_index=True)
     csv = show.to_csv(index=False).encode("utf-8")
-    st.download_button("Download as CSV", csv, file_name="meters_export.csv", mime="text/csv", key=f"dl_{columns[0]}_{len(view_df)}")
+    # Use a hash of the CSV content to guarantee a unique key even when the
+    # same table function is called multiple times with identical row counts.
+    import hashlib
+    key_hash = hashlib.md5(csv).hexdigest()[:10]
+    st.download_button(
+        "Download as CSV", csv,
+        file_name="meters_export.csv", mime="text/csv",
+        key=f"dl_{columns[0]}_{key_hash}"
+    )
 
 
 # ---------- Load data ----------
