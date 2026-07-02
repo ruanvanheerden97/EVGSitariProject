@@ -183,6 +183,9 @@ def load_kiosk_data(file_path, _mtime):
     edf["installed"] = edf["Meter Commission Date"].notna()
     edf["amr_done"] = edf["AMR Installed"].fillna(False).astype(bool)
     edf["stand_str"] = edf["Stand Number"].astype(str).str.strip()
+    edf["deadline"] = pd.to_datetime(
+        coalesce_col(edf, ["Snag Date 4"]), errors="coerce"
+    )
 
     def _fmt_serial(v):
         if pd.isna(v): return ""
@@ -191,15 +194,19 @@ def load_kiosk_data(file_path, _mtime):
 
     edf["serial_str"] = edf["Meter Serial"].apply(_fmt_serial)
 
-    # stand → {installed, amr, serial}
-    stand_detail = {
-        row["stand_str"]: {
-            "installed": bool(row["installed"]),
-            "amr": bool(row["amr_done"]),
-            "serial": row["serial_str"],
-        }
-        for _, row in edf.iterrows()
-    }
+    today = pd.Timestamp(date.today())
+    edf["days_to_deadline"] = (edf["deadline"] - today).dt.days
+
+    def _stand_status(row):
+        if row["installed"]:
+            return "installed"
+        if pd.notna(row["deadline"]) and row["deadline"] < today:
+            return "overdue"
+        if pd.notna(row["deadline"]) and row["days_to_deadline"] <= 14:
+            return "due_soon"
+        return "on_track"
+
+    edf["stand_status"] = edf.apply(_stand_status, axis=1)
 
     # Aggregate per kiosk
     def agg_stands(x):
@@ -212,9 +219,26 @@ def load_kiosk_data(file_path, _mtime):
         return sorted(edf.loc[x.index][edf.loc[x.index, "amr_done"]]["stand_str"].tolist())
 
     def agg_stand_serials(x):
-        """Return dict of stand → serial for stands that have a serial."""
         subset = edf.loc[x.index][edf.loc[x.index, "serial_str"] != ""]
         return {row["stand_str"]: row["serial_str"] for _, row in subset.iterrows()}
+
+    def agg_overdue_stands(x):
+        return sorted(edf.loc[x.index][edf.loc[x.index, "stand_status"] == "overdue"]["stand_str"].tolist())
+
+    def agg_due_soon_stands(x):
+        return sorted(edf.loc[x.index][edf.loc[x.index, "stand_status"] == "due_soon"]["stand_str"].tolist())
+
+    def agg_stand_deadlines(x):
+        """Return dict of stand → {deadline_str, days_to, status} for uninstalled stands."""
+        subset = edf.loc[x.index][~edf.loc[x.index, "installed"] & edf.loc[x.index, "deadline"].notna()]
+        return {
+            row["stand_str"]: {
+                "deadline": row["deadline"].strftime("%d %b %Y"),
+                "days_to": int(row["days_to_deadline"]) if pd.notna(row["days_to_deadline"]) else 999,
+                "status": row["stand_status"],
+            }
+            for _, row in subset.iterrows()
+        }
 
     kiosk_agg = edf.groupby("Kiosk Number").agg(
         installed_count=("installed", "sum"),
@@ -224,8 +248,15 @@ def load_kiosk_data(file_path, _mtime):
         installed_stands=("stand_str", agg_installed_stands),
         amr_stands=("stand_str", agg_amr_stands),
         stand_serials=("stand_str", agg_stand_serials),
+        overdue_stands=("stand_str", agg_overdue_stands),
+        due_soon_stands=("stand_str", agg_due_soon_stands),
+        stand_deadlines=("stand_str", agg_stand_deadlines),
     ).reset_index()
-    kiosk_agg.columns = ["kiosk", "installed", "amr_count", "total", "stands", "installed_stands", "amr_stands", "stand_serials"]
+    kiosk_agg.columns = [
+        "kiosk", "installed", "amr_count", "total",
+        "stands", "installed_stands", "amr_stands", "stand_serials",
+        "overdue_stands", "due_soon_stands", "stand_deadlines",
+    ]
 
     # Merge plan vs actuals
     merged = kp.merge(kiosk_agg, left_on="Kiosk Number", right_on="kiosk", how="left")
@@ -237,6 +268,9 @@ def load_kiosk_data(file_path, _mtime):
     merged["installed_stands"] = merged["installed_stands"].apply(lambda x: x if isinstance(x, list) else [])
     merged["amr_stands"] = merged["amr_stands"].apply(lambda x: x if isinstance(x, list) else [])
     merged["stand_serials"] = merged["stand_serials"].apply(lambda x: x if isinstance(x, dict) else {})
+    merged["overdue_stands"] = merged["overdue_stands"].apply(lambda x: x if isinstance(x, list) else [])
+    merged["due_soon_stands"] = merged["due_soon_stands"].apply(lambda x: x if isinstance(x, list) else [])
+    merged["stand_deadlines"] = merged["stand_deadlines"].apply(lambda x: x if isinstance(x, dict) else {})
 
     # Build hierarchy: minisub → list of kiosks
     def sort_kiosk_key(k):
@@ -260,6 +294,9 @@ def load_kiosk_data(file_path, _mtime):
             "installed_stands": row["installed_stands"],
             "amr_stands": row["amr_stands"],
             "stand_serials": row["stand_serials"],
+            "overdue_stands": row["overdue_stands"],
+            "due_soon_stands": row["due_soon_stands"],
+            "stand_deadlines": row["stand_deadlines"],
             "comment": str(row.get("Comments", "") or ""),
         })
 
@@ -738,6 +775,19 @@ with tab_retic:
   .serial-popup .sp-amr-ok {{ color: #6eb88a; }}
   .serial-popup .sp-amr-miss {{ color: #d4902a; }}
   .serial-popup .sp-pending {{ color: #7a9ec4; font-style: italic; }}
+  /* Deadline badges on chips */
+  .dl-badge {{
+    display: inline-block; font-size: 8px; padding: 0 4px; border-radius: 3px;
+    font-weight: 700; vertical-align: middle; margin-left: 2px; letter-spacing: .02em;
+  }}
+  .dl-overdue {{ background: #BD4B2C44; color: #e07060; border: 1px solid #BD4B2C66; }}
+  .dl-due-soon {{ background: #E6913844; color: #d4902a; border: 1px solid #E6913866; }}
+  .kiosk-deadline-row {{ display: flex; gap: 6px; margin-top: 4px; flex-wrap: wrap; }}
+  .kiosk-dl-tag {{
+    font-size: 9px; padding: 1px 7px; border-radius: 10px; font-weight: 600;
+  }}
+  .kiosk-dl-tag.overdue {{ background: #BD4B2C33; color: #e07060; border: 1px solid #BD4B2C55; }}
+  .kiosk-dl-tag.due-soon {{ background: #E6913833; color: #d4902a; border: 1px solid #E6913855; }}
 </style>
 </head>
 <body>
@@ -749,6 +799,8 @@ with tab_retic:
   <div class="legend-item"><span class="legend-swatch" style="background:#3F7D5C33;border:1px solid #3F7D5C66"></span><span style="color:#6eb88a">Meter ✓ · AMR ✓</span></div>
   <div class="legend-item"><span class="legend-swatch" style="background:#E6913833;border:1px solid #E6913866"></span><span style="color:#d4902a">Meter ✓ · AMR pending</span></div>
   <div class="legend-item"><span class="legend-swatch" style="background:#1F3F6633;border:1px solid #334d6e"></span><span style="color:#7a9ec4">Meter not yet installed</span></div>
+  <div class="legend-item"><span class="dl-badge dl-overdue" style="display:inline-block">OVR</span><span style="color:#e07060;margin-left:4px">Past Snag Date 4</span></div>
+  <div class="legend-item"><span class="dl-badge dl-due-soon" style="display:inline-block">DUE</span><span style="color:#d4902a;margin-left:4px">Due within 14 days</span></div>
 </div>
 
 <div class="supply-bus">
@@ -775,7 +827,7 @@ function barColor(p) {{
   return '#BD4B2C';
 }}
 
-function showPopup(e, stand, serial, inst, amr) {{
+function showPopup(e, stand, serial, inst, amr, deadline, days, dlstatus) {{
   const amrHtml = !inst
     ? `<span class="sp-pending">Meter not yet installed</span>`
     : amr
@@ -784,16 +836,24 @@ function showPopup(e, stand, serial, inst, amr) {{
   const serialHtml = serial
     ? `<span class="sp-val">${{serial}}</span>`
     : `<span class="sp-pending">No serial recorded</span>`;
+  const deadlineHtml = deadline
+    ? (dlstatus === 'overdue'
+        ? `<span class="sp-amr-miss">${{deadline}} (${{Math.abs(days)}}d overdue)</span>`
+        : dlstatus === 'due_soon'
+          ? `<span style="color:#d4902a">${{deadline}} (${{days}}d remaining)</span>`
+          : `<span class="sp-val">${{deadline}} (${{days}}d remaining)</span>`)
+    : `<span class="sp-pending">—</span>`;
 
   popup.innerHTML = `
     <div class="sp-stand">Stand ${{stand}}</div>
     <div class="sp-row"><span class="sp-label">Meter serial</span>${{serialHtml}}</div>
-    <div class="sp-row"><span class="sp-label">Meter status</span><span class="sp-val">${{inst ? 'Installed' : 'Pending'}}</span></div>
+    <div class="sp-row"><span class="sp-label">Status</span><span class="sp-val">${{inst ? 'Installed' : 'Not installed'}}</span></div>
     <div class="sp-row"><span class="sp-label">AMR</span>${{amrHtml}}</div>
+    ${{!inst ? '<div class="sp-row"><span class="sp-label">Deadline</span>' + deadlineHtml + '</div>' : ''}}
   `;
   popup.classList.add('visible');
-  const x = Math.min(e.clientX + 12, window.innerWidth - 220);
-  const y = Math.min(e.clientY + 12, window.innerHeight - 140);
+  const x = Math.min(e.clientX + 12, window.innerWidth - 230);
+  const y = Math.min(e.clientY + 12, window.innerHeight - 160);
   popup.style.left = x + 'px';
   popup.style.top = y + 'px';
   e.stopPropagation();
@@ -871,6 +931,11 @@ function buildDiagram() {{
           <span class="amr-ok-count">✓ ${{k.amr_count}} done</span>
           ${{(k.installed - k.amr_count) > 0 ? '<span class="amr-miss-count">⚠ ' + (k.installed - k.amr_count) + ' pending</span>' : ''}}
         </div>` : ''}}
+        ${{(k.overdue_stands && k.overdue_stands.length > 0) || (k.due_soon_stands && k.due_soon_stands.length > 0) ? `
+        <div class="kiosk-deadline-row">
+          ${{k.overdue_stands && k.overdue_stands.length > 0 ? '<span class="kiosk-dl-tag overdue">🟥 ' + k.overdue_stands.length + ' overdue</span>' : ''}}
+          ${{k.due_soon_stands && k.due_soon_stands.length > 0 ? '<span class="kiosk-dl-tag due-soon">🟧 ' + k.due_soon_stands.length + ' due soon</span>' : ''}}
+        </div>` : ''}}
         ${{isRemoved ? '<div style="font-size:9px;color:#5a4040;margin-top:3px;">Kiosk removed</div>' : ''}}
       `;
 
@@ -882,22 +947,39 @@ function buildDiagram() {{
         const installedSet = new Set(k.installed_stands);
         const amrSet = new Set(k.amr_stands);
         const serialMap = k.stand_serials || {{}};
+        const overduSet = new Set(k.overdue_stands || []);
+        const dueSoonSet = new Set(k.due_soon_stands || []);
+        const deadlineMap = k.stand_deadlines || {{}};
         const chipsHtml = k.stands.map(s => {{
           const inst = installedSet.has(s);
           const amr = amrSet.has(s);
           const serial = serialMap[s] || '';
           const isHighlight = highlightStands.has(s);
+          const isOverdue = overduSet.has(s);
+          const isDueSoon = dueSoonSet.has(s);
+          const dlInfo = deadlineMap[s] || null;
+
           let cls = 'stand-chip pending';
           if (inst && amr) cls = 'stand-chip';
           else if (inst) cls = 'stand-chip no-amr';
           if (isHighlight) cls += ' highlight';
+
           const dot = inst
             ? `<span class="amr-dot ${{amr ? 'ok' : 'missing'}}"></span>`
             : `<span class="amr-dot" style="background:#334d6e"></span>`;
+
+          const dlBadge = !inst && isOverdue
+            ? `<span class="dl-badge dl-overdue">OVR</span>`
+            : !inst && isDueSoon
+              ? `<span class="dl-badge dl-due-soon">DUE</span>`
+              : '';
+
+          const dlTitle = dlInfo ? ` · Deadline: ${{dlInfo.deadline}} (${{dlInfo.days_to < 0 ? Math.abs(dlInfo.days_to) + 'd overdue' : dlInfo.days_to + 'd remaining'}})` : '';
           const title = inst
             ? `Stand ${{s}} · Serial: ${{serial || 'not recorded'}} · AMR: ${{amr ? '✓' : 'pending'}}`
-            : `Stand ${{s}} · Meter not yet installed`;
-          return `<span class="${{cls}}" data-stand="${{s}}" data-serial="${{serial}}" data-inst="${{inst}}" data-amr="${{amr}}" title="${{title}}">${{dot}}${{s}}</span>`;
+            : `Stand ${{s}} · Not installed${{dlTitle}}`;
+
+          return `<span class="${{cls}}" data-stand="${{s}}" data-serial="${{serial}}" data-inst="${{inst}}" data-amr="${{amr}}" data-deadline="${{dlInfo ? dlInfo.deadline : ''}}" data-days="${{dlInfo ? dlInfo.days_to : ''}}" data-dlstatus="${{dlInfo ? dlInfo.status : ''}}" title="${{title}}">${{dot}}${{s}}${{dlBadge}}</span>`;
         }}).join('');
         const amrMissing = k.installed - k.amr_count;
         detail.innerHTML = `
@@ -905,6 +987,8 @@ function buildDiagram() {{
             STANDS (${{k.stands.length}} in sheet · ${{k.planned}} planned)
             &nbsp;·&nbsp; <span class="amr-ok-count">AMR done: ${{k.amr_count}}</span>
             ${{amrMissing > 0 ? '&nbsp;·&nbsp; <span class="amr-miss-count">AMR pending: ' + amrMissing + '</span>' : ''}}
+            ${{(k.overdue_stands||[]).length > 0 ? '&nbsp;·&nbsp; <span style="color:#e07060">🟥 ' + k.overdue_stands.length + ' overdue</span>' : ''}}
+            ${{(k.due_soon_stands||[]).length > 0 ? '&nbsp;·&nbsp; <span style="color:#d4902a">🟧 ' + k.due_soon_stands.length + ' due soon</span>' : ''}}
           </div>
           <div class="stand-grid">${{chipsHtml}}</div>
           ${{k.comment && k.comment !== 'nan' ? '<div class="comment-tag">📌 ' + k.comment + '</div>' : ''}}
@@ -919,7 +1003,10 @@ function buildDiagram() {{
               chip.dataset.stand,
               chip.dataset.serial,
               chip.dataset.inst === 'True',
-              chip.dataset.amr === 'True'
+              chip.dataset.amr === 'True',
+              chip.dataset.deadline || '',
+              chip.dataset.days !== '' ? parseInt(chip.dataset.days) : null,
+              chip.dataset.dlstatus || ''
             );
           }});
         }});
