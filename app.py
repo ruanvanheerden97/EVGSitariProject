@@ -5,7 +5,10 @@ from datetime import datetime, date
 import glob
 import os
 import json
+import xml.etree.ElementTree as ET
 import streamlit.components.v1 as components
+import folium
+from streamlit_folium import st_folium
 
 st.set_page_config(
     page_title="Sitari Evergreen — Meter Commissioning",
@@ -81,6 +84,13 @@ def find_data_file():
     """The spreadsheet lives in this same repo folder — push an updated copy
     whenever it changes, and this picks up the most recently modified match."""
     matches = glob.glob(os.path.join(os.path.dirname(__file__), FILE_PATTERN))
+    if not matches:
+        return None
+    return max(matches, key=os.path.getmtime)
+
+def find_kml_file():
+    """Auto-detect the KML file in the same folder as app.py."""
+    matches = glob.glob(os.path.join(os.path.dirname(__file__), "*.kml"))
     if not matches:
         return None
     return max(matches, key=os.path.getmtime)
@@ -307,6 +317,235 @@ def load_kiosk_data(file_path, _mtime):
     return hierarchy
 
 
+# ── KML helpers ──────────────────────────────────────────────────────────────
+
+KML_NS = "{http://www.opengis.net/kml/2.2}"
+
+def _kml_text(el, tag):
+    child = el.find(f"{KML_NS}{tag}")
+    return child.text.strip() if child is not None and child.text else ""
+
+def _parse_coords(coord_str):
+    """Parse KML coordinate string into list of [lat, lon] pairs."""
+    pairs = []
+    for token in coord_str.strip().split():
+        parts = token.split(",")
+        if len(parts) >= 2:
+            try:
+                lon, lat = float(parts[0]), float(parts[1])
+                pairs.append([lat, lon])
+            except ValueError:
+                pass
+    return pairs
+
+def parse_kml(kml_bytes):
+    """
+    Parse a KML file exported from Google Earth.
+    Returns:
+      polygons  — list of {name, coords [[lat,lon],...], description}
+      placemarks — list of {name, lat, lon, description}  (point placemarks = kiosks)
+    """
+    root = ET.fromstring(kml_bytes)
+    polygons, placemarks = [], []
+
+    def walk(node):
+        for pm in node.findall(f".//{KML_NS}Placemark"):
+            name = _kml_text(pm, "name")
+            desc = _kml_text(pm, "description")
+
+            # Polygon
+            poly = pm.find(f".//{KML_NS}Polygon")
+            if poly is not None:
+                outer = poly.find(
+                    f".//{KML_NS}outerBoundaryIs/{KML_NS}LinearRing/{KML_NS}coordinates"
+                )
+                if outer is not None and outer.text:
+                    coords = _parse_coords(outer.text)
+                    if coords:
+                        polygons.append({"name": name, "coords": coords, "description": desc})
+                continue
+
+            # Point (kiosk marker)
+            point = pm.find(f".//{KML_NS}Point/{KML_NS}coordinates")
+            if point is not None and point.text:
+                parts = point.text.strip().split(",")
+                if len(parts) >= 2:
+                    try:
+                        lon, lat = float(parts[0]), float(parts[1])
+                        placemarks.append({"name": name, "lat": lat, "lon": lon, "description": desc})
+                    except ValueError:
+                        pass
+
+    walk(root)
+    return polygons, placemarks
+
+
+def stand_map_color(stand_str, df):
+    """Return fill colour and status label for a stand based on commissioning data."""
+    rows = df[df["stand"] == stand_str]
+    if rows.empty:
+        return "#607080", 0.35, "No data"   # dark grey – stand not in sheet
+
+    # Collect water + elec rows
+    elec = rows[rows["meter_type"] == "Electrical"]
+    water = rows[rows["meter_type"] == "Water"]
+
+    elec_inst   = elec["installed"].any()   if not elec.empty else False
+    water_inst  = water["installed"].any()  if not water.empty else False
+    elec_amr    = elec["amr"].any()         if not elec.empty else False
+    water_amr   = water["amr"].any()        if not water.empty else False
+
+    # Overdue: any uninstalled row past deadline
+    overdue = rows[~rows["installed"] & rows["deadline"].notna() &
+                   (rows["deadline"] < pd.Timestamp(date.today()))]
+    due_soon = rows[~rows["installed"] & rows["deadline"].notna() &
+                    ((rows["deadline"] - pd.Timestamp(date.today())).dt.days <= 14) &
+                    ((rows["deadline"] - pd.Timestamp(date.today())).dt.days >= 0)]
+
+    both_inst = elec_inst and water_inst
+    both_amr  = elec_amr and water_amr
+
+    if both_inst and both_amr:
+        return "#2E7D52", 0.75, "Meter ✓ · AMR ✓"           # deep green
+    if both_inst and not both_amr:
+        return "#E69138", 0.75, "Meter ✓ · AMR pending"      # amber
+    if (elec_inst or water_inst) and not (elec_inst and water_inst):
+        return "#5B86B3", 0.70, "Partially installed"         # blue
+    if not overdue.empty:
+        return "#BD4B2C", 0.80, "Overdue"                     # red
+    if not due_soon.empty:
+        return "#D4AC0D", 0.70, "Due soon"                    # yellow
+    return "#3A5068", 0.50, "On track – not yet due"          # dark blue
+
+
+def build_estate_map(polygons, placemarks, df, center):
+    m = folium.Map(
+        location=center,
+        zoom_start=17,
+        tiles=None,
+    )
+
+    # Satellite tile layer
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Imagery",
+        name="Satellite",
+        overlay=False,
+        control=True,
+    ).add_to(m)
+
+    # Streets overlay for orientation
+    folium.TileLayer(
+        tiles="https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png",
+        attr="© OpenStreetMap, © CARTO",
+        name="Labels",
+        overlay=True,
+        control=True,
+        opacity=0.6,
+    ).add_to(m)
+
+    # ── House polygons ────────────────────────────────────────────────
+    for poly in polygons:
+        stand = poly["name"].strip()
+        color, opacity, status_label = stand_map_color(stand, df)
+        rows = df[df["stand"] == stand]
+
+        # Build popup HTML
+        elec = rows[rows["meter_type"] == "Electrical"]
+        water = rows[rows["meter_type"] == "Water"]
+
+        def row_html(r_df, label):
+            if r_df.empty:
+                return f"<tr><td><b>{label}</b></td><td colspan='2' style='color:#999'>Not in sheet</td></tr>"
+            r = r_df.iloc[0]
+            serial = r["serial"] if r["serial"] else "—"
+            inst = "✅ " + r["commission_date"].strftime("%d %b %Y") if r["installed"] and pd.notna(r["commission_date"]) else "⏳ Pending"
+            amr = "✅ Yes" if r["amr"] else "⏳ No"
+            dl = r["deadline"].strftime("%d %b %Y") if pd.notna(r["deadline"]) else "—"
+            return (
+                f"<tr><td><b>{label}</b></td><td>{inst}</td><td>AMR: {amr}</td></tr>"
+                f"<tr><td style='color:#888;font-size:10px'>Serial</td><td colspan='2' style='font-family:monospace'>{serial}</td></tr>"
+                f"<tr><td style='color:#888;font-size:10px'>Deadline</td><td colspan='2'>{dl}</td></tr>"
+            )
+
+        popup_html = f"""
+        <div style='font-family:sans-serif;min-width:220px;'>
+          <div style='font-size:14px;font-weight:700;margin-bottom:8px;color:#152B45'>Stand {stand}</div>
+          <div style='display:inline-block;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:600;
+               background:{color}22;color:{color};border:1px solid {color}66;margin-bottom:8px'>{status_label}</div>
+          <table style='width:100%;font-size:12px;border-collapse:collapse'>
+            {row_html(elec, "Electrical")}
+            {row_html(water, "Water")}
+          </table>
+        </div>"""
+
+        folium.Polygon(
+            locations=poly["coords"],
+            color=color,
+            weight=1.5,
+            fill=True,
+            fill_color=color,
+            fill_opacity=opacity,
+            tooltip=f"Stand {stand} — {status_label}",
+            popup=folium.Popup(popup_html, max_width=280),
+        ).add_to(m)
+
+        # Stand number label at centroid
+        if poly["coords"]:
+            clat = sum(c[0] for c in poly["coords"]) / len(poly["coords"])
+            clon = sum(c[1] for c in poly["coords"]) / len(poly["coords"])
+            folium.Marker(
+                [clat, clon],
+                icon=folium.DivIcon(
+                    html=f"<div style='font-size:7px;font-weight:700;color:#fff;text-shadow:0 0 2px #000;'>{stand}</div>",
+                    icon_size=(28, 12),
+                    icon_anchor=(14, 6),
+                ),
+            ).add_to(m)
+
+    # ── Kiosk placemarks ─────────────────────────────────────────────
+    for pm in placemarks:
+        kname = pm["name"].strip()
+        # Count installed vs planned for this kiosk from df
+        kiosk_rows = df[(df["meter_type"] == "Electrical") &
+                        df.get("kiosk_number", pd.Series(dtype=str)).eq(kname)
+                        if "kiosk_number" in df.columns else pd.Series([False]*len(df))]
+
+        folium.Marker(
+            location=[pm["lat"], pm["lon"]],
+            icon=folium.DivIcon(
+                html=f"""<div style='
+                    background:#E69138;color:#1a1305;font-size:9px;font-weight:700;
+                    padding:3px 6px;border-radius:5px;border:1px solid #B96E1E;
+                    white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,.5);
+                '>⚡ {kname}</div>""",
+                icon_size=(70, 22),
+                icon_anchor=(35, 11),
+            ),
+            tooltip=kname,
+            popup=folium.Popup(
+                f"<b>Kiosk {kname}</b><br>{pm['description'] or ''}",
+                max_width=200
+            ),
+        ).add_to(m)
+
+    folium.LayerControl().add_to(m)
+    return m
+
+
+def kml_center(polygons, placemarks):
+    """Compute map center from all coordinates."""
+    all_lats, all_lons = [], []
+    for p in polygons:
+        for lat, lon in p["coords"]:
+            all_lats.append(lat); all_lons.append(lon)
+    for p in placemarks:
+        all_lats.append(p["lat"]); all_lons.append(p["lon"])
+    if all_lats:
+        return [sum(all_lats)/len(all_lats), sum(all_lons)/len(all_lons)]
+    return [-25.7, 28.2]   # fallback: Pretoria area
+
+
 def summary_counters(view_df, full_df, label):
     """Shows total counts for this category, plus a water/electrical split,
     and how many remain after the filters above are applied."""
@@ -389,8 +628,8 @@ c5.metric("Overdue", overdue_n, delta_color="inverse")
 st.divider()
 
 # ---------- Tabs ----------
-tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic = st.tabs(
-    ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed", "📅 Calendar", "📊 Sections", "⚡ Reticulation"]
+tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic, tab_map = st.tabs(
+    ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed", "📅 Calendar", "📊 Sections", "⚡ Reticulation", "🗺️ Estate Map"]
 )
 
 COLS = ["stand", "meter_type", "unit_type", "wbho_section", "deadline", "status"]
@@ -1054,3 +1293,115 @@ if (highlightStands.size > 0) {{
 """
 
     components.html(html, height=900, scrolling=True)
+
+# =====================================================================
+# ESTATE MAP TAB
+# =====================================================================
+with tab_map:
+    st.subheader("\U0001f5fa\ufe0f Estate Map \u2014 Installation Status")
+
+    # Auto-load KML from repo folder, fall back to upload
+    auto_kml_path = find_kml_file()
+    saved_kml, saved_kml_name = None, None
+
+    if auto_kml_path:
+        with open(auto_kml_path, "rb") as _f:
+            saved_kml = _f.read()
+        saved_kml_name = os.path.basename(auto_kml_path)
+
+    uploaded_kml = st.file_uploader(
+        "Upload a different KML file (optional — auto-loaded from repo if present)",
+        type=["kml"], key="kml_uploader"
+    )
+    if uploaded_kml is not None:
+        saved_kml = uploaded_kml.read()
+        saved_kml_name = uploaded_kml.name
+
+    if saved_kml is None:
+        st.info(
+            "No KML found. Commit your `EVG_Sitari.kml` into the repo folder alongside `app.py` "
+            "and it will load automatically — or upload it using the button above."
+        )
+    else:
+        st.caption(f"\U0001f4c2 Using **{saved_kml_name}**")
+
+        try:
+            polygons, kiosks, minisubs = parse_kml(saved_kml)
+        except Exception as e:
+            st.error(f"Could not parse KML: {e}")
+            polygons, kiosks, minisubs = [], [], []
+
+        if not polygons and not kiosks and not minisubs:
+            st.warning("Nothing found in this KML — check folder names contain \'unit\', \'kiosk\', or \'minisub\'.")
+        else:
+            st.caption(
+                f"\U0001f3e0 **{len(polygons)}** unit polygons \u00b7 "
+                f"\u26a1 **{len(kiosks)}** kiosks \u00b7 "
+                f"\U0001f50c **{len(minisubs)}** minisubs"
+            )
+
+            # ── Controls ────────────────────────────────────────────────
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                map_meter_type = st.radio(
+                    "Colour polygons by", ["Both meters", "Electrical only", "Water only"],
+                    horizontal=True, key="map_meter_type"
+                )
+            with col_b:
+                show_kiosks_map  = st.checkbox("Show kiosk labels", value=True, key="map_show_kiosks")
+                show_minisubs    = st.checkbox("Show minisub markers", value=True, key="map_show_ms")
+            with col_c:
+                show_stand_labels = st.checkbox("Show stand number labels", value=True, key="map_stand_labels")
+
+            map_df = df.copy()
+            if map_meter_type == "Electrical only":
+                map_df = df[df["meter_type"] == "Electrical"]
+            elif map_meter_type == "Water only":
+                map_df = df[df["meter_type"] == "Water"]
+
+            # ── Legend ──────────────────────────────────────────────────
+            legend_items = [
+                ("#2E7D52", "Meter \u2713 \u00b7 AMR \u2713"),
+                ("#E69138", "Meters \u2713 \u00b7 AMR pending"),
+                ("#5B86B3", "Partially installed"),
+                ("#BD4B2C", "Overdue"),
+                ("#D4AC0D", "Due soon"),
+                ("#3A5068", "On track"),
+                ("#607080", "No data"),
+            ]
+            lg = "<div style=\'display:flex;flex-wrap:wrap;gap:10px;padding:6px 0;font-size:12px;align-items:center;\'>"
+            for color, label in legend_items:
+                lg += (f"<div style=\'display:flex;align-items:center;gap:5px;\'>"
+                       f"<span style=\'display:inline-block;width:13px;height:13px;border-radius:3px;"
+                       f"background:{color};border:1px solid {color}99\'></span><span>{label}</span></div>")
+            lg += "</div>"
+            st.markdown(lg, unsafe_allow_html=True)
+
+            # ── KPIs ────────────────────────────────────────────────────
+            mapped_stands = {p["name"].strip() for p in polygons}
+            matched = df[df["stand"].isin(mapped_stands)]
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("Polygons on map", len(polygons))
+            k2.metric("Matched to data", len(matched["stand"].unique()))
+            k3.metric("Installed (matched)", int(matched["installed"].sum()))
+            k4.metric("AMR done (matched)", int(matched["amr"].sum()))
+            k5.metric("Kiosks / Minisubs", f"{len(kiosks)} / {len(minisubs)}")
+
+            # ── Render map ──────────────────────────────────────────────
+            center = kml_center(polygons, kiosks, minisubs)
+            with st.spinner("Building map\u2026"):
+                m = build_estate_map(
+                    polygons,
+                    kiosks  if show_kiosks_map else [],
+                    minisubs if show_minisubs  else [],
+                    map_df,
+                    center,
+                    show_stand_labels,
+                )
+                st_folium(m, use_container_width=True, height=660, returned_objects=[])
+
+            st.caption(
+                "Satellite imagery: Esri World Imagery. "
+                "Click any house polygon to see meter and AMR status. "
+                "Commit an updated KML to the repo to refresh the map."
+            )
