@@ -164,30 +164,53 @@ def load_kiosk_data(file_path, _mtime):
     kp["MS Serial"] = kp["MS Serial"].astype(int).astype(str)
     kp["planned"] = pd.to_numeric(kp["New planned units"], errors="coerce").fillna(0).astype(int)
 
-    # --- Elec Meters (installed counts per kiosk, stand list) ---
+    # --- Elec Meters (installed counts per kiosk, stand list, AMR) ---
     elec_name = find_sheet(xls, ["Elec Meters", "Electrical Meters"])
     edf = xls.parse(elec_name)
     edf.columns = [str(c).strip() for c in edf.columns]
     edf = edf[edf["Kiosk Number"].notna()].copy()
     edf["installed"] = edf["Meter Commission Date"].notna()
+    edf["amr_done"] = edf["AMR Installed"].fillna(False).astype(bool)
     edf["stand_str"] = edf["Stand Number"].astype(str).str.strip()
 
+    # Build per-stand detail lookup: stand → {installed, amr}
+    stand_detail = {
+        row["stand_str"]: {
+            "installed": bool(row["installed"]),
+            "amr": bool(row["amr_done"]),
+        }
+        for _, row in edf.iterrows()
+    }
+
     # Aggregate per kiosk
+    def agg_stands(x):
+        return sorted(x.tolist())
+
+    def agg_installed_stands(x):
+        return sorted(edf.loc[x.index][edf.loc[x.index, "installed"]]["stand_str"].tolist())
+
+    def agg_amr_stands(x):
+        return sorted(edf.loc[x.index][edf.loc[x.index, "amr_done"]]["stand_str"].tolist())
+
     kiosk_agg = edf.groupby("Kiosk Number").agg(
         installed_count=("installed", "sum"),
+        amr_count=("amr_done", "sum"),
         total_count=("Stand Number", "count"),
-        stands=("stand_str", lambda x: sorted(x.tolist())),
-        installed_stands=("stand_str", lambda x: sorted(edf.loc[x.index][edf.loc[x.index, "installed"]]["stand_str"].tolist())),
+        stands=("stand_str", agg_stands),
+        installed_stands=("stand_str", agg_installed_stands),
+        amr_stands=("stand_str", agg_amr_stands),
     ).reset_index()
-    kiosk_agg.columns = ["kiosk", "installed", "total", "stands", "installed_stands"]
+    kiosk_agg.columns = ["kiosk", "installed", "amr_count", "total", "stands", "installed_stands", "amr_stands"]
 
     # Merge plan vs actuals
     merged = kp.merge(kiosk_agg, left_on="Kiosk Number", right_on="kiosk", how="left")
     merged["installed"] = merged["installed"].fillna(0).astype(int)
+    merged["amr_count"] = merged["amr_count"].fillna(0).astype(int)
     merged["total"] = merged["total"].fillna(0).astype(int)
     merged["planned"] = merged["planned"].astype(int)
     merged["stands"] = merged["stands"].apply(lambda x: x if isinstance(x, list) else [])
     merged["installed_stands"] = merged["installed_stands"].apply(lambda x: x if isinstance(x, list) else [])
+    merged["amr_stands"] = merged["amr_stands"].apply(lambda x: x if isinstance(x, list) else [])
 
     # Build hierarchy: minisub → list of kiosks
     def sort_kiosk_key(k):
@@ -205,9 +228,11 @@ def load_kiosk_data(file_path, _mtime):
             "kiosk": row["Kiosk Number"],
             "planned": int(row["planned"]),
             "installed": int(row["installed"]),
+            "amr_count": int(row["amr_count"]),
             "total_in_sheet": int(row["total"]),
             "stands": row["stands"],
             "installed_stands": row["installed_stands"],
+            "amr_stands": row["amr_stands"],
             "comment": str(row.get("Comments", "") or ""),
         })
 
@@ -216,6 +241,7 @@ def load_kiosk_data(file_path, _mtime):
         hierarchy[ms_id]["kiosks"].sort(key=lambda k: sort_kiosk_key(k["kiosk"]))
 
     return hierarchy
+
 
 def summary_counters(view_df, full_df, label):
     """Shows total counts for this category, plus a water/electrical split,
@@ -465,13 +491,15 @@ with tab_retic:
     all_kiosks = [k for ms in hierarchy.values() for k in ms["kiosks"]]
     total_planned = sum(k["planned"] for k in all_kiosks)
     total_installed = sum(k["installed"] for k in all_kiosks)
+    total_amr = sum(k["amr_count"] for k in all_kiosks)
     total_outstanding = sum(max(0, k["planned"] - k["installed"]) for k in all_kiosks)
 
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Total kiosks", sum(len(ms["kiosks"]) for ms in hierarchy.values()))
     k2.metric("Planned meter points", total_planned)
-    k3.metric("Installed", total_installed, f"{round(total_installed/total_planned*100) if total_planned else 0}%")
-    k4.metric("Outstanding", total_outstanding)
+    k3.metric("Meters installed", total_installed, f"{round(total_installed/total_planned*100) if total_planned else 0}%")
+    k4.metric("AMR commissioned", total_amr, f"{round(total_amr/total_installed*100) if total_installed else 0}% of installed")
+    k5.metric("Outstanding", total_outstanding)
 
     st.divider()
 
@@ -481,11 +509,13 @@ with tab_retic:
         ms = hierarchy[ms_id]
         ms_installed = sum(k["installed"] for k in ms["kiosks"])
         ms_planned = sum(k["planned"] for k in ms["kiosks"])
+        ms_amr = sum(k["amr_count"] for k in ms["kiosks"])
         diagram_data.append({
             "ms_id": ms_id,
             "serial": ms["serial"],
             "ms_installed": ms_installed,
             "ms_planned": ms_planned,
+            "ms_amr": ms_amr,
             "kiosks": ms["kiosks"],
         })
 
@@ -587,14 +617,44 @@ with tab_retic:
   .stand-chip {{
     padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600;
     background: #3F7D5C22; color: #6eb88a; border: 1px solid #3F7D5C55;
+    display: inline-flex; align-items: center; gap: 3px;
+  }}
+  .stand-chip.no-amr {{
+    background: #E6913822; color: #d4902a; border: 1px solid #E6913866;
   }}
   .stand-chip.pending {{
     background: #1F3F6622; color: #7a9ec4; border: 1px solid #334d6e;
+  }}
+  .amr-dot {{
+    display: inline-block; width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+  }}
+  .amr-dot.ok {{ background: #3F7D5C; }}
+  .amr-dot.missing {{ background: #E69138; }}
+  .kiosk-amr-line {{
+    font-size: 9px; color: #7A96B2; margin-top: 3px; display: flex; gap: 8px;
+  }}
+  .amr-ok-count {{ color: #6eb88a; }}
+  .amr-miss-count {{ color: #d4902a; }}
+  .legend-bar {{
+    display: flex; gap: 14px; margin-bottom: 14px; flex-wrap: wrap;
+    font-size: 10px; align-items: center; padding: 8px 12px;
+    background: #0d1520; border: 1px solid #1e3050; border-radius: 6px;
+  }}
+  .legend-item {{ display: flex; align-items: center; gap: 5px; }}
+  .legend-swatch {{
+    width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0;
   }}
   .comment-tag {{ font-size: 9px; color: #7A6040; margin-top: 5px; font-style: italic; }}
 </style>
 </head>
 <body>
+
+<div class="legend-bar">
+  <strong style="color:#9FB0C2;font-size:10px;letter-spacing:.06em;">STAND STATUS:</strong>
+  <div class="legend-item"><span class="legend-swatch" style="background:#3F7D5C33;border:1px solid #3F7D5C66"></span><span style="color:#6eb88a">Meter ✓ · AMR ✓</span></div>
+  <div class="legend-item"><span class="legend-swatch" style="background:#E6913833;border:1px solid #E6913866"></span><span style="color:#d4902a">Meter ✓ · AMR pending</span></div>
+  <div class="legend-item"><span class="legend-swatch" style="background:#1F3F6633;border:1px solid #334d6e"></span><span style="color:#7a9ec4">Meter not yet installed</span></div>
+</div>
 
 <div class="supply-bus">
   <div class="bus-line"></div>
@@ -641,6 +701,10 @@ function buildDiagram() {{
       <div class="ms-progress">
         <div class="progress-track"><div class="progress-fill" style="width:${{p}}%; background:${{barColor(p)}}"></div></div>
         <div class="ms-counts">${{ms.ms_installed}} / ${{ms.ms_planned}} installed (${{p}}%)</div>
+        <div class="ms-counts" style="margin-top:2px;">
+          <span class="amr-ok-count">AMR: ${{ms.ms_amr}} ✓</span>
+          ${{(ms.ms_installed - ms.ms_amr) > 0 ? ' &nbsp;<span class="amr-miss-count">⚠ ' + (ms.ms_installed - ms.ms_amr) + ' pending</span>' : ''}}
+        </div>
       </div>
     `;
     col.appendChild(msBox);
@@ -679,6 +743,11 @@ function buildDiagram() {{
           <span class="kiosk-counts">${{k.installed}}/${{k.planned}}</span>
           ${{!isRemoved ? '<span class="kiosk-chevron" id="chev-' + k.kiosk + '">▾</span>' : ''}}
         </div>
+        ${{k.installed > 0 ? `<div class="kiosk-amr-line">
+          <span>AMR:</span>
+          <span class="amr-ok-count">✓ ${{k.amr_count}} done</span>
+          ${{(k.installed - k.amr_count) > 0 ? '<span class="amr-miss-count">⚠ ' + (k.installed - k.amr_count) + ' pending</span>' : ''}}
+        </div>` : ''}}
         ${{isRemoved ? '<div style="font-size:9px;color:#5a4040;margin-top:3px;">Kiosk removed</div>' : ''}}
       `;
 
@@ -688,12 +757,31 @@ function buildDiagram() {{
 
       if (!isRemoved) {{
         const installedSet = new Set(k.installed_stands);
+        const amrSet = new Set(k.amr_stands);
         const chipsHtml = k.stands.map(s => {{
-          const done = installedSet.has(s);
-          return `<span class="stand-chip ${{done ? '' : 'pending'}}" title="Stand ${{s}} — ${{done ? 'Installed ✅' : 'Pending ⏳'}}">${{s}}</span>`;
+          const inst = installedSet.has(s);
+          const amr = amrSet.has(s);
+          if (!inst) {{
+            return `<span class="stand-chip pending" title="Stand ${{s}} — Meter not yet installed">
+              <span class="amr-dot" style="background:#334d6e"></span>${{s}}
+            </span>`;
+          }} else if (amr) {{
+            return `<span class="stand-chip" title="Stand ${{s}} — Meter ✓ · AMR ✓">
+              <span class="amr-dot ok"></span>${{s}}
+            </span>`;
+          }} else {{
+            return `<span class="stand-chip no-amr" title="Stand ${{s}} — Meter ✓ · AMR pending">
+              <span class="amr-dot missing"></span>${{s}}
+            </span>`;
+          }}
         }}).join('');
+        const amrMissing = k.installed - k.amr_count;
         detail.innerHTML = `
-          <div style="font-size:9px;color:#5B86B3;margin-bottom:4px;">STANDS (${{k.stands.length}} in sheet · ${{k.planned}} planned)</div>
+          <div style="font-size:9px;color:#5B86B3;margin-bottom:4px;">
+            STANDS (${{k.stands.length}} in sheet · ${{k.planned}} planned)
+            &nbsp;·&nbsp; <span class="amr-ok-count">AMR done: ${{k.amr_count}}</span>
+            ${{amrMissing > 0 ? '&nbsp;·&nbsp; <span class="amr-miss-count">AMR pending: ' + amrMissing + '</span>' : ''}}
+          </div>
           <div class="stand-grid">${{chipsHtml}}</div>
           ${{k.comment && k.comment !== 'nan' ? '<div class="comment-tag">📌 ' + k.comment + '</div>' : ''}}
         `;
