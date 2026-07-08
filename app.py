@@ -106,69 +106,140 @@ def find_kml_file():
 # ── AMR / SFTP helpers ────────────────────────────────────────────────────────
 
 AMR_CACHE_FILE = os.path.join(os.path.dirname(__file__), "amr_cache.json")
-AMR_DB_FILE    = os.path.join(os.path.dirname(__file__), "amr_history.db")
 CSV_FILENAME_RE = re.compile(r"^[A-Z]+_(\d{8})_(\d{6})\.csv$", re.IGNORECASE)
 
-# ── SQLite history database ───────────────────────────────────────────────────
-import sqlite3
+# ── Supabase / PostgreSQL history database ────────────────────────────────────
+try:
+    import psycopg2
+    import psycopg2.extras
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    PSYCOPG2_AVAILABLE = False
+
+
+def _get_db_url():
+    """Read the Supabase connection URL from st.secrets or env."""
+    try:
+        return st.secrets["db"]["url"]
+    except Exception:
+        return os.environ.get("DB_URL")
+
 
 def _db_conn():
-    conn = sqlite3.connect(AMR_DB_FILE, check_same_thread=False)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS amr_readings (
-            serial       TEXT NOT NULL,
-            reading_date TEXT NOT NULL,
-            reading_value REAL,
-            low_battery  INTEGER DEFAULT 0,
-            file_ts      TEXT,
-            PRIMARY KEY (serial, reading_date)
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_serial ON amr_readings(serial)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_date   ON amr_readings(reading_date)")
-    conn.commit()
+    """Open a Supabase PostgreSQL connection and ensure the table exists."""
+    if not PSYCOPG2_AVAILABLE:
+        raise RuntimeError("psycopg2 not installed — add psycopg2-binary to requirements.txt")
+    url = _get_db_url()
+    if not url:
+        raise RuntimeError("No database URL. Add [db] url to .streamlit/secrets.toml")
+    # The ! in passwords needs encoding, so pass params explicitly
+    # Also try appending sslmode for Supabase
+    try:
+        conn = psycopg2.connect(url, sslmode="require", connect_timeout=10)
+    except Exception:
+        conn = psycopg2.connect(url, connect_timeout=10)
+    # Ensure table exists (fast no-op if already present)
+    if "amr_table_created" not in st.session_state:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS amr_readings (
+                    serial        TEXT    NOT NULL,
+                    reading_date  TEXT    NOT NULL,
+                    reading_value DOUBLE PRECISION,
+                    low_battery   INTEGER DEFAULT 0,
+                    file_ts       TEXT,
+                    PRIMARY KEY (serial, reading_date)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_amr_serial  ON amr_readings(serial)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_amr_date    ON amr_readings(reading_date)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_amr_file_ts ON amr_readings(file_ts)")
+        conn.commit()
+        st.session_state["amr_table_created"] = True
     return conn
 
+
 def db_upsert_readings(readings_dict, file_ts_str):
-    """Insert new readings into the history DB. Existing (serial, reading_date) pairs are ignored."""
-    conn = _db_conn()
+    """Insert new readings. Existing (serial, reading_date) pairs are silently skipped."""
+    if not PSYCOPG2_AVAILABLE or not _get_db_url():
+        return 0
     rows = [
         (serial, v["reading_date"], v["reading_value"], v["low_battery"], file_ts_str)
         for serial, v in readings_dict.items()
         if v.get("reading_date")
     ]
-    conn.executemany(
-        "INSERT OR IGNORE INTO amr_readings (serial, reading_date, reading_value, low_battery, file_ts) VALUES (?,?,?,?,?)",
-        rows
-    )
+    if not rows:
+        return 0
+    conn = _db_conn()
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_values(
+            cur,
+            """INSERT INTO amr_readings (serial, reading_date, reading_value, low_battery, file_ts)
+               VALUES %s
+               ON CONFLICT (serial, reading_date) DO NOTHING""",
+            rows,
+            page_size=500,
+        )
     conn.commit()
     conn.close()
     return len(rows)
 
+
 def db_get_history(serial):
-    """Return DataFrame of all readings for a serial, sorted by date ascending."""
-    conn = _db_conn()
-    df = pd.read_sql_query(
-        "SELECT reading_date, reading_value, low_battery FROM amr_readings WHERE serial=? ORDER BY reading_date ASC",
-        conn, params=(serial,)
-    )
-    conn.close()
-    if not df.empty:
-        df["reading_date"] = pd.to_datetime(df["reading_date"], errors="coerce")
-    return df
+    """Return DataFrame of all readings for a serial, sorted ascending by date."""
+    if not PSYCOPG2_AVAILABLE or not _get_db_url():
+        return pd.DataFrame(columns=["reading_date", "reading_value", "low_battery"])
+    try:
+        conn = _db_conn()
+        df = pd.read_sql_query(
+            "SELECT reading_date, reading_value, low_battery FROM amr_readings "
+            "WHERE serial = %s ORDER BY reading_date ASC",
+            conn, params=(serial,)
+        )
+        conn.close()
+        if not df.empty:
+            df["reading_date"] = pd.to_datetime(df["reading_date"], errors="coerce")
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["reading_date", "reading_value", "low_battery"])
+
 
 @st.cache_data(ttl=30, show_spinner=False)
 def db_stats():
     """Return (total_rows, distinct_serials, min_date, max_date) from DB."""
+    if not PSYCOPG2_AVAILABLE or not _get_db_url():
+        return (0, 0, None, None)
     try:
         conn = _db_conn()
-        row = conn.execute(
-            "SELECT COUNT(*), COUNT(DISTINCT serial), MIN(reading_date), MAX(reading_date) FROM amr_readings"
-        ).fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT serial), "
+                "MIN(reading_date), MAX(reading_date) FROM amr_readings"
+            )
+            row = cur.fetchone()
         conn.close()
         return row
     except Exception:
         return (0, 0, None, None)
+
+
+def get_latest_file_ts():
+    """Return the most recent file_ts in the DB as a datetime, or None if empty."""
+    if not PSYCOPG2_AVAILABLE or not _get_db_url():
+        return None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT MAX(file_ts) FROM amr_readings WHERE file_ts IS NOT NULL"
+            )
+            row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            return datetime.fromisoformat(row[0])
+    except Exception:
+        pass
+    return None
 
 
 def _parse_csv_filename_ts(name):
@@ -269,13 +340,13 @@ def fetch_amr_from_sftp(host, port, username, password, directory, _cache_bust=0
         return {}, None, None, str(e)
 
 
-def fetch_amr_bulk_history(host, port, username, password, directory, hours=24, progress_cb=None):
+def fetch_amr_bulk_history(host, port, username, password, directory,
+                           hours=24, since_dt=None, progress_cb=None):
     """
-    Connect to SFTP, download ALL CSV files whose filename timestamp falls within
-    the last `hours` hours, parse each, and upsert into the history DB.
+    Connect to SFTP, download CSV files within the time window, parse, and upsert into DB.
+    If `since_dt` is provided, fetches all files with filename timestamp >= since_dt.
+    Otherwise falls back to the last `hours` hours.
     Returns (files_processed, new_readings_inserted, latest_readings_dict, error_str).
-    `progress_cb(current, total, filename)` is called for each file if provided.
-    Not cached — intended for one-off bulk historical loads.
     """
     if not PARAMIKO_AVAILABLE:
         return 0, 0, {}, "paramiko not installed"
@@ -295,13 +366,12 @@ def fetch_amr_bulk_history(host, port, username, password, directory, hours=24, 
             transport.close()
             return 0, 0, {}, "No CSV files found in directory"
 
-        cutoff = datetime.now() - timedelta(hours=hours)
+        cutoff = since_dt if since_dt else (datetime.now() - timedelta(hours=hours))
 
         def ts_key(name):
             ts = _parse_csv_filename_ts(name)
             return ts if ts else datetime.min
 
-        # Filter to files within the window, newest first
         in_window = sorted(
             [f for f in csv_files if ts_key(f) >= cutoff],
             key=ts_key, reverse=True
@@ -309,7 +379,7 @@ def fetch_amr_bulk_history(host, port, username, password, directory, hours=24, 
 
         if not in_window:
             transport.close()
-            return 0, 0, {}, f"No CSV files found within the last {hours} hours"
+            return 0, 0, {}, f"No CSV files found since {cutoff.strftime('%d %b %Y %H:%M')}"
 
         files_done = 0
         total_new  = 0
@@ -328,11 +398,10 @@ def fetch_amr_bulk_history(host, port, username, password, directory, hours=24, 
                 n = db_upsert_readings(readings, file_ts.isoformat() if file_ts else None)
                 total_new += n
                 files_done += 1
-                # Keep the readings from the most recent file as the "current" snapshot
                 if i == 0:
                     latest_readings = readings
             except Exception:
-                continue  # skip corrupt / unreadable files silently
+                continue
 
         transport.close()
         return files_done, total_new, latest_readings, None
@@ -2290,6 +2359,46 @@ with tab_amr:
         type=["csv"], key="amr_csv_upload"
     )
 
+    # ── Auto-sync on startup ──────────────────────────────────────────
+    # Runs once per browser session. Checks what the most recent file in
+    # the DB is and fetches any SFTP files newer than that — so the DB
+    # always catches up automatically without manual intervention.
+    if sftp_ready and "amr_auto_synced" not in st.session_state:
+        latest_ts = get_latest_file_ts()
+        now = datetime.now()
+
+        if latest_ts is None:
+            # DB is empty (fresh deploy) — seed with last 24 hours
+            sync_since = now - timedelta(hours=24)
+            sync_label = "last 24h (no data in DB)"
+        elif (now - latest_ts).total_seconds() > 3600:
+            # More than one hour since last fetched file — catch up
+            sync_since = latest_ts
+            sync_label = f"since {latest_ts.strftime('%d %b %Y %H:%M')}"
+        else:
+            sync_since = None
+            sync_label = None
+
+        if sync_since:
+            with st.spinner(f"🔄 Auto-syncing AMR readings ({sync_label})…"):
+                _af, _ar, _rdgs, _err = fetch_amr_bulk_history(
+                    sftp_host, int(sftp_port), sftp_user, sftp_pass, sftp_dir,
+                    since_dt=sync_since
+                )
+            if _err:
+                st.warning(f"Auto-sync warning: {_err}")
+            elif _ar > 0:
+                st.toast(f"✅ Auto-synced {_af} files · {_ar} new readings added to history DB")
+                # Use the latest fetched readings as the current snapshot
+                if _rdgs:
+                    save_amr_cache({"readings": _rdgs, "source": "Auto-sync",
+                                    "file_ts": None})
+            else:
+                st.toast("✅ AMR history is up to date")
+
+        st.session_state["amr_auto_synced"] = True  # don't repeat this session
+
+
     col_fetch, col_bulk, col_hours, col_last = st.columns([1, 1.2, 0.8, 2])
     with col_fetch:
         fetch_clicked = st.button("🔄 Fetch latest from SFTP", disabled=not sftp_ready, key="amr_fetch_btn")
@@ -2371,18 +2480,28 @@ with tab_amr:
             raw_ts        = cached.get("file_ts")
             amr_file_ts  = datetime.fromisoformat(raw_ts) if raw_ts else None
 
-    # Auto-fetch on page load if SFTP configured and no data yet
+    # Auto-fetch on page load if SFTP configured and no data yet.
+    # The auto-sync above will have already populated the DB and cache if it ran,
+    # so try loading from cache first before making another SFTP round-trip.
     if not amr_readings and sftp_ready and not fetch_clicked and not bulk_clicked:
-        import time
-        cache_bust = int(time.time() // 3600)
-        with st.spinner("Auto-fetching latest readings from SFTP…"):
-            amr_readings, fname, amr_file_ts, amr_error = fetch_amr_from_sftp(
-                sftp_host, int(sftp_port), sftp_user, sftp_pass, sftp_dir, cache_bust
-            )
-        if not amr_error and amr_readings:
-            amr_source = f"SFTP: {fname}"
-            save_amr_cache({"readings": amr_readings, "source": amr_source,
-                            "file_ts": amr_file_ts.isoformat() if amr_file_ts else None})
+        # Re-check cache (auto-sync may have just written to it)
+        cached = load_amr_cache()
+        if cached and cached.get("readings"):
+            amr_readings = cached["readings"]
+            amr_source   = cached.get("source", "Auto-sync")
+            raw_ts       = cached.get("file_ts")
+            amr_file_ts  = datetime.fromisoformat(raw_ts) if raw_ts else None
+        else:
+            import time
+            cache_bust = int(time.time() // 3600)
+            with st.spinner("Fetching latest readings from SFTP…"):
+                amr_readings, fname, amr_file_ts, amr_error = fetch_amr_from_sftp(
+                    sftp_host, int(sftp_port), sftp_user, sftp_pass, sftp_dir, cache_bust
+                )
+            if not amr_error and amr_readings:
+                amr_source = f"SFTP: {fname}"
+                save_amr_cache({"readings": amr_readings, "source": amr_source,
+                                "file_ts": amr_file_ts.isoformat() if amr_file_ts else None})
 
     with col_last:
         if amr_source:
