@@ -2486,8 +2486,11 @@ with tab_amr:
                         n_low   = int(hist_sub["low_battery"].sum())
 
                         # Calculate consumption (delta between readings)
+                        # Pre-compute derived columns before the tab split
+                        # so both tabs can access them
                         hist_sub = hist_sub.copy()
                         hist_sub["consumption"] = hist_sub["reading_value"].diff().clip(lower=0)
+                        hist_sub["gap_hours"]   = hist_sub["reading_date"].diff().dt.total_seconds() / 3600
 
                         tab_chart, tab_raw = st.tabs([f"📈 {mtype} chart", f"📋 Raw readings ({n_reads})"])
 
@@ -2515,7 +2518,6 @@ with tab_amr:
                                     yaxis="y2",
                                 ))
                                 # Mark gaps (missed readings) — points where gap > 3 hours
-                                hist_sub["gap_hours"] = hist_sub["reading_date"].diff().dt.total_seconds() / 3600
                                 gaps = hist_sub[hist_sub["gap_hours"] > 3]
                                 if not gaps.empty:
                                     fig.add_trace(go.Scatter(
