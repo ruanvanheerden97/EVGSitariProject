@@ -1671,12 +1671,13 @@ st.divider()
 
 # ---------- Tabs ----------
 if is_apartments:
-    tab_floorplan, tab_installed, tab_aprt_retic, tab_balance, tab_amr = st.tabs(
-        ["🏬 Floor Plan", "🟩 Installed", "🏢 Apt Reticulation", "⚖️ Balancing", "📡 AMR Live"]
+    tab_floorplan, tab_installed, tab_aprt_retic, tab_balance = st.tabs(
+        ["🏬 Floor Plan", "🟩 Installed", "🏢 Apt Reticulation", "⚖️ Balancing"]
     )
     # Unused stubs for apartment mode (tabs don't exist, set to None)
     tab_outstanding = tab_upcoming = tab_overdue = tab_calendar = None
     tab_sections = tab_retic = tab_map = tab_faulty = None
+    tab_amr = None
 else:
     tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic, tab_map, tab_faulty, tab_balance, tab_amr = st.tabs(
         ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed",
@@ -2729,7 +2730,8 @@ if not is_apartments:
 # =====================================================================
 # AMR LIVE TAB
 # =====================================================================
-with tab_amr:
+if not is_apartments:
+ with tab_amr:
     st.subheader("📡 AMR Live — Meter Reading Status")
     st.caption(
         "Matches meter serials from your commissioning spreadsheet against the latest "
@@ -3472,18 +3474,48 @@ with tab_balance:
 
             # Apartment bulk under this minisub?
             blk = MS_TO_BLOCK.get(f"MS{int(float(ms_id))}" if str(ms_id).replace('.','').isdigit() else str(ms_id).upper())
-            bulk_delta = None
-            bulk_label = ""
+            bulk_delta   = None
+            bulk_label   = ""
+            bulk_virtual = False
+            bulk_virtual_missing = 0
             if blk and aprt_hier[blk].get("bulk"):
                 bs = aprt_hier[blk]["bulk"]["serial"]
                 bulk_delta = _delta(bs)
                 bulk_label = f"{blk} Bulk ({bs})"
+                if bulk_delta is None:
+                    # Virtual bulk: no reading from the physical bulk meter yet,
+                    # so use the sum of its child check meters (DBs + Lifts/UPS/Plant)
+                    # as a stand-in until AMR is installed on the bulk.
+                    _e = aprt_hier[blk]
+                    _vchecks = dict(_e["checks"])
+                    for _dbn, _d in _e["dbs"].items():
+                        if _dbn not in _vchecks:
+                            _vchecks[_dbn] = {"serial": _d["check_serial"], "amr": _d["check_amr"]}
+                    _vd = [_delta(c["serial"]) for c in _vchecks.values()]
+                    _vh = [x for x in _vd if x is not None]
+                    if _vh:
+                        bulk_delta = sum(_vh)
+                        bulk_virtual = True
+                        bulk_virtual_missing = len(_vd) - len(_vh)
+                        bulk_label = f"{blk} virtual bulk (Σ {len(_vh)} check meters)"
 
             children_total = kiosk_sum + (bulk_delta or 0)
-            miss_total = kiosk_missing + (1 if (blk and bulk_delta is None) else 0)
+            if blk and bulk_delta is None:
+                miss_total = kiosk_missing + 1                       # bulk fully dark
+            elif bulk_virtual:
+                miss_total = kiosk_missing + bulk_virtual_missing    # partial virtual
+            else:
+                miss_total = kiosk_missing
 
             with st.expander(f"🔌 Minisub {ms_id} · serial {ms_serial}", expanded=False):
                 _bal_row(f"MS{ms_id} vs all children", ms_serial, children_total, miss_total)
+                if bulk_virtual:
+                    st.caption(
+                        f"ℹ️ {blk} bulk meter has no AMR reading yet — using the sum of its "
+                        f"check meters as a **virtual bulk**"
+                        + (f" ({bulk_virtual_missing} check meters also without readings)" if bulk_virtual_missing else "")
+                        + ". Replaced automatically once the bulk meter starts importing."
+                    )
                 st.markdown("---")
                 st.markdown("**Kiosks** (sum of stand meters per kiosk)")
                 for kname, ksum, khave, kmiss in kiosk_details:
@@ -3495,7 +3527,8 @@ with tab_balance:
                     bc = st.columns([2, 1.4, 2])
                     bc[0].caption(f"🏢 {bulk_label}")
                     bc[1].caption(f"{bulk_delta:,.1f} kWh" if bulk_delta is not None else "no reading")
-                    bc[2].caption("" if bulk_delta is not None else "counted in losses")
+                    bc[2].caption("virtual — Σ of check meters" if bulk_virtual
+                                  else ("" if bulk_delta is not None else "counted in losses"))
 
         # ── Level 2 & 3: Apartment blocks ──────────────────────────────
         st.markdown("#### Levels 2–3 — Apartment blocks")
@@ -3573,6 +3606,37 @@ if is_apartments and tab_floorplan is not None:
         _fp_readings = _cached["readings"]
     if not _fp_readings:
         _fp_readings = load_latest_from_db()
+
+    # ── Overall AMR stats per meter type ───────────────────────────────
+    st.markdown("#### 📡 AMR status — Electricity · Cold Water · Hot Water")
+    _type_icons_fp = {"Electrical": "⚡", "Water (Cold)": "💧", "Water (Hot)": "♨️"}
+    for _t in ["Electrical", "Water (Cold)", "Water (Hot)"]:
+        _tsub = df[(df["meter_type"] == _t) & df["installed"] & df["serial"].str.len().gt(0)]
+        if _tsub.empty:
+            continue
+        _amr_in  = _tsub[_tsub["amr"]]
+        _pending = _tsub[~_tsub["amr"]]
+        _badges  = {"amr-green": 0, "amr-yellow": 0, "amr-orange": 0, "amr-red": 0, "amr-never": 0}
+        _lowbat  = 0
+        for _, _r in _amr_in.iterrows():
+            _rd = _fp_readings.get(_r["serial"])
+            _, _, _b = amr_status_info(_rd.get("reading_date") if _rd else None)
+            _badges[_b] = _badges.get(_b, 0) + 1
+            if _rd and int(_rd.get("low_battery", 0)):
+                _lowbat += 1
+        _tt = len(_amr_in)
+        s1, s2, s3, s4, s5, s6, s7, s8 = st.columns(8)
+        s1.metric(f"{_type_icons_fp.get(_t,'')} {_t}", _tt, "AMR commissioned")
+        s2.metric("🟢 <24h",  _badges["amr-green"],
+                  f"{round(_badges['amr-green']/_tt*100) if _tt else 0}%")
+        s3.metric("🟡 1–3d",  _badges["amr-yellow"])
+        s4.metric("🟠 4–7d",  _badges["amr-orange"])
+        s5.metric("🔴 7d+",   _badges["amr-red"])
+        s6.metric("⚫ Never",  _badges["amr-never"])
+        s7.metric("🔧 Pending", len(_pending))
+        s8.metric("🔋 Low bat", _lowbat)
+
+    st.divider()
 
     fp_type = st.radio("Colour by meter type", ["Electrical", "Water (Cold)", "Water (Hot)"],
                        horizontal=True, key="fp_meter_type")
