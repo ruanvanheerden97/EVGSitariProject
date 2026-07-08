@@ -4,3 +4,4 @@ openpyxl>=3.1
 folium>=0.17
 streamlit-folium>=0.22
 paramiko>=3.4
+plotly>=5.22
