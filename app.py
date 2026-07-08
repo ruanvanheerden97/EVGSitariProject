@@ -242,6 +242,37 @@ def get_latest_file_ts():
     return None
 
 
+def load_latest_from_db():
+    """
+    Reconstruct amr_readings dict (serial → {reading_date, reading_value, low_battery})
+    from the DB by picking the most recent reading per serial.
+    Used to restore the live display after a redeploy without re-fetching SFTP.
+    """
+    if not PSYCOPG2_AVAILABLE or not _get_db_url():
+        return {}
+    try:
+        conn = _db_conn()
+        df = pd.read_sql_query(
+            """SELECT DISTINCT ON (serial)
+                   serial, reading_date, reading_value, low_battery, file_ts
+               FROM amr_readings
+               ORDER BY serial, reading_date DESC""",
+            conn
+        )
+        conn.close()
+        result = {}
+        for _, row in df.iterrows():
+            result[row["serial"]] = {
+                "reading_date":  row["reading_date"],
+                "reading_value": row["reading_value"],
+                "low_battery":   int(row["low_battery"] or 0),
+                "file_ts":       row["file_ts"],
+            }
+        return result
+    except Exception:
+        return {}
+
+
 def _parse_csv_filename_ts(name):
     """Extract datetime from SIT_YYYYMMDD_HHMMSS.csv → datetime or None."""
     m = CSV_FILENAME_RE.match(os.path.basename(name))
@@ -344,9 +375,8 @@ def fetch_amr_bulk_history(host, port, username, password, directory,
                            hours=24, since_dt=None, progress_cb=None):
     """
     Connect to SFTP, download CSV files within the time window, parse, and upsert into DB.
-    If `since_dt` is provided, fetches all files with filename timestamp >= since_dt.
-    Otherwise falls back to the last `hours` hours.
     Returns (files_processed, new_readings_inserted, latest_readings_dict, error_str).
+    DB failures are logged but don't prevent file counting or amr_readings capture.
     """
     if not PARAMIKO_AVAILABLE:
         return 0, 0, {}, "paramiko not installed"
@@ -378,33 +408,58 @@ def fetch_amr_bulk_history(host, port, username, password, directory,
         )
 
         if not in_window:
+            # No files in window — return the most recent file anyway as current snapshot
+            all_sorted = sorted(csv_files, key=ts_key, reverse=True)
+            if all_sorted:
+                fname = all_sorted[0]
+                file_ts = ts_key(fname)
+                buf = io.BytesIO()
+                sftp.getfo(directory.rstrip("/") + "/" + fname, buf)
+                transport.close()
+                readings = parse_amr_csv(buf.getvalue(), file_ts)
+                try:
+                    db_upsert_readings(readings, file_ts.isoformat() if file_ts else None)
+                except Exception:
+                    pass
+                return 1, 0, readings, None
             transport.close()
             return 0, 0, {}, f"No CSV files found since {cutoff.strftime('%d %b %Y %H:%M')}"
 
-        files_done = 0
-        total_new  = 0
+        files_done  = 0
+        total_new   = 0
         latest_readings = {}
+        db_errors   = []
 
         for i, fname in enumerate(in_window):
             if progress_cb:
                 progress_cb(i + 1, len(in_window), fname)
 
-            file_ts = _parse_csv_filename_ts(fname)
+            file_ts = ts_key(fname)
             remote_path = directory.rstrip("/") + "/" + fname
             try:
                 buf = io.BytesIO()
                 sftp.getfo(remote_path, buf)
                 readings = parse_amr_csv(buf.getvalue(), file_ts)
-                n = db_upsert_readings(readings, file_ts.isoformat() if file_ts else None)
-                total_new += n
                 files_done += 1
+                # Always capture the most recent file's readings for the live display
                 if i == 0:
                     latest_readings = readings
+                # Try to persist to DB — failure here doesn't discard the file
+                try:
+                    n = db_upsert_readings(readings, file_ts.isoformat() if file_ts else None)
+                    total_new += n
+                except Exception as db_err:
+                    db_errors.append(str(db_err))
             except Exception:
                 continue
 
         transport.close()
-        return files_done, total_new, latest_readings, None
+
+        error_msg = None
+        if db_errors and files_done > 0:
+            error_msg = f"DB write errors ({len(db_errors)}): {db_errors[0]}"
+
+        return files_done, total_new, latest_readings, error_msg
 
     except Exception as e:
         return 0, 0, {}, str(e)
@@ -2440,21 +2495,29 @@ with tab_amr:
         progress_bar.empty()
         status_text.empty()
 
-        if bulk_err:
-            st.error(f"SFTP error: {bulk_err}")
+        if bulk_err and files_done == 0:
+            # Complete failure — no files downloaded at all
+            st.error(f"SFTP/fetch error: {bulk_err}")
         else:
-            total_rows, distinct_serials, mn, mx = db_stats()
-            st.success(
-                f"✅ Fetched **{files_done}** files from the last {bulk_hours}h · "
-                f"**{new_rows}** new readings added to history DB · "
-                f"DB now holds **{total_rows:,}** readings across **{distinct_serials}** serials "
-                f"({mn[:10] if mn else '—'} → {mx[:10] if mx else '—'})"
-            )
+            # Always save latest readings to cache regardless of DB success
             if latest_rdgs:
                 amr_readings = latest_rdgs
                 amr_source   = f"SFTP bulk ({bulk_hours}h)"
                 amr_file_ts  = None
                 save_amr_cache({"readings": amr_readings, "source": amr_source, "file_ts": None})
+
+            total_rows, distinct_serials, mn, mx = db_stats()
+            st.success(
+                f"✅ Fetched **{files_done}** files · "
+                f"**{new_rows}** new readings added to DB · "
+                f"DB now holds **{total_rows:,}** readings across **{distinct_serials}** serials "
+                f"({mn[:10] if mn else '—'} → {mx[:10] if mx else '—'})"
+            )
+            # If DB had connection errors, surface them so they're diagnosable
+            if bulk_err and files_done > 0:
+                st.warning(f"⚠️ Files were fetched but DB writes had errors — readings are in the live display only. DB error: {bulk_err}")
+            if files_done == 0 and not latest_rdgs:
+                st.info(f"No CSV files found in the selected window ({bulk_hours}h). The most recent file on SFTP may be older — try increasing the hours window.")
 
     elif fetch_clicked and sftp_ready:
         import time
@@ -2472,13 +2535,23 @@ with tab_amr:
             st.success(f"Fetched **{fname}** — {len(amr_readings)} meter readings loaded.")
 
     else:
-        # Load from local cache (persists across restarts on self-hosted)
+        # Load from local JSON cache (fast — written after each fetch)
         cached = load_amr_cache()
         if cached and cached.get("readings"):
             amr_readings = cached["readings"]
             amr_source   = cached.get("source", "Cached data")
             raw_ts        = cached.get("file_ts")
             amr_file_ts  = datetime.fromisoformat(raw_ts) if raw_ts else None
+        else:
+            # Cache is empty (fresh redeploy) — restore snapshot from Supabase DB
+            with st.spinner("Restoring latest readings from database…"):
+                db_restored = load_latest_from_db()
+            if db_restored:
+                amr_readings = db_restored
+                amr_source   = "Restored from Supabase DB"
+                amr_file_ts  = None
+                save_amr_cache({"readings": amr_readings, "source": amr_source, "file_ts": None})
+                st.toast(f"✅ Restored {len(db_restored)} meter readings from database")
 
     # Auto-fetch on page load if SFTP configured and no data yet.
     # The auto-sync above will have already populated the DB and cache if it ran,
