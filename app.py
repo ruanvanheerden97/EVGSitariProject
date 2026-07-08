@@ -1522,8 +1522,8 @@ st.divider()
 
 # ---------- Tabs ----------
 if is_apartments:
-    tab_installed, tab_aprt_retic, tab_amr = st.tabs(
-        ["🟩 Installed", "🏢 Apt Reticulation", "📡 AMR Live"]
+    tab_installed, tab_aprt_retic, tab_floorplan, tab_amr = st.tabs(
+        ["🟩 Installed", "🏢 Apt Reticulation", "🏬 Floor Plan", "📡 AMR Live"]
     )
     # Unused stubs for apartment mode (tabs don't exist, set to None)
     tab_outstanding = tab_upcoming = tab_overdue = tab_calendar = None
@@ -1535,6 +1535,7 @@ else:
          "⚠️ Faulty Meters", "📡 AMR Live"]
     )
     tab_aprt_retic = None
+    tab_floorplan = None
 
 COLS   = ["stand", "meter_type", "unit_type", "wbho_section", "deadline", "status"]
 RENAME = {"stand":"Stand","meter_type":"Type","unit_type":"Unit type",
@@ -1765,11 +1766,43 @@ if not is_apartments:
         highlight_stands = match["stand"].tolist()
 
     diagram_data = []
+
+    # Apartment blocks hang off the minisubs: Block A ← MS2, Block B ← MS1
+    aprt_hier_fs = load_aprt_reticulation(data_path, mtime)
+    BLOCK_TO_MS = {"Block A": 2, "Block B": 1}
+    BLOCK_LABEL = {"Block A": "Block A · Helderberg Suites", "Block B": "Block B · Tafelberg Suites"}
+    ms_aprt_blocks = {}   # ms_id → block payload
+    for _bname, _dbs in (aprt_hier_fs or {}).items():
+        _bkey = _bname.strip()
+        _ms_id = BLOCK_TO_MS.get(_bkey)
+        if _ms_id is None:
+            continue
+        _db_list = []
+        for _dbname in sorted(_dbs.keys()):
+            _db = _dbs[_dbname]
+            _db_list.append({
+                "db": _dbname,
+                "parent_meter": _db["parent_meter"],
+                "total": _db["total"],
+                "amr_count": _db["amr_count"],
+            })
+        ms_aprt_blocks[_ms_id] = {
+            "block": _bkey,
+            "label": BLOCK_LABEL.get(_bkey, _bkey),
+            "total": sum(d["total"] for d in _db_list),
+            "amr_count": sum(d["amr_count"] for d in _db_list),
+            "dbs": _db_list,
+        }
+
     for ms_id in sorted(hierarchy.keys()):
         ms = hierarchy[ms_id]
         ms_installed = sum(k["installed"] for k in ms["kiosks"])
         ms_planned = sum(k["planned"] for k in ms["kiosks"])
         ms_amr = sum(k["amr_count"] for k in ms["kiosks"])
+        try:
+            _ms_int = int(float(ms_id))
+        except (ValueError, TypeError):
+            _ms_int = None
         diagram_data.append({
             "ms_id": ms_id,
             "serial": ms["serial"],
@@ -1777,6 +1810,7 @@ if not is_apartments:
             "ms_planned": ms_planned,
             "ms_amr": ms_amr,
             "kiosks": ms["kiosks"],
+            "aprt_block": ms_aprt_blocks.get(_ms_int),
         })
 
     diagram_json = json.dumps(diagram_data)
@@ -2221,6 +2255,70 @@ function buildDiagram() {{
       entry.appendChild(detail);
       grid.appendChild(entry);
     }});
+
+    // ── Apartment block node (Block A ← MS2, Block B ← MS1) ──
+    if (ms.aprt_block) {{
+      const ab = ms.aprt_block;
+      const abEntry = document.createElement('div');
+      abEntry.className = 'kiosk-entry';
+
+      const abDrop = document.createElement('div');
+      abDrop.className = 'kiosk-drop-line';
+      abDrop.style.background = '#8B5CF6';
+      abEntry.appendChild(abDrop);
+
+      const abPct = pct(ab.amr_count, ab.total);
+      const abNode = document.createElement('div');
+      abNode.className = 'kiosk-node';
+      abNode.style.borderColor = '#8B5CF6';
+      abNode.style.background = '#1a1530';
+      abNode.innerHTML = `
+        <div class="kiosk-header">
+          <span class="kiosk-id" style="color:#A78BFA">🏢 ${{ab.block}}</span>
+          <div class="kiosk-bar-wrap">
+            <div class="kiosk-mini-bar">
+              <div class="kiosk-mini-fill" style="width:${{abPct}}%; background:#8B5CF6"></div>
+            </div>
+          </div>
+          <span class="kiosk-counts">${{ab.amr_count}}/${{ab.total}}</span>
+          <span class="kiosk-chevron" id="chev-ab-${{ab.block.replace(/\\s/g,'')}}">▾</span>
+        </div>
+        <div class="kiosk-amr-line">
+          <span style="color:#A78BFA">${{ab.label}}</span>
+        </div>`;
+
+      const abDetail = document.createElement('div');
+      abDetail.className = 'kiosk-detail';
+      abDetail.id = 'detail-ab-' + ab.block.replace(/\\s/g,'');
+      const dbRows = ab.dbs.map(d => {{
+        const dpc = pct(d.amr_count, d.total);
+        return `<div style="display:flex;align-items:center;gap:6px;padding:2px 0;font-size:10px">
+          <span style="color:#c8d8eb;min-width:130px;font-weight:600">${{d.db}}</span>
+          <div style="flex:1;height:4px;border-radius:2px;background:#2a3f55;overflow:hidden">
+            <div style="height:100%;width:${{dpc}}%;background:#8B5CF6"></div>
+          </div>
+          <span style="color:#7A96B2;white-space:nowrap">${{d.amr_count}}/${{d.total}} AMR</span>
+          ${{d.parent_meter && d.parent_meter !== 'nan' ? '<span style="color:#5B86B3;font-family:monospace;font-size:9px">' + d.parent_meter + '</span>' : ''}}
+        </div>`;
+      }}).join('');
+      abDetail.innerHTML = `
+        <div style="font-size:9px;color:#A78BFA;margin-bottom:4px;">
+          DISTRIBUTION BOARDS (${{ab.dbs.length}}) · switch to 🏢 Apartments view for full detail
+        </div>
+        ${{dbRows}}`;
+
+      abNode.addEventListener('click', function() {{
+        const d = document.getElementById('detail-ab-' + ab.block.replace(/\\s/g,''));
+        const chev = document.getElementById('chev-ab-' + ab.block.replace(/\\s/g,''));
+        const open = d.classList.toggle('open');
+        abNode.classList.toggle('expanded', open);
+        if (chev) chev.classList.toggle('open', open);
+      }});
+
+      abEntry.appendChild(abNode);
+      abEntry.appendChild(abDetail);
+      grid.appendChild(abEntry);
+    }}
 
     col.appendChild(grid);
     root.appendChild(col);
@@ -3170,3 +3268,193 @@ if is_apartments:
             disp = inst[["stand","unit_type","wbho_section","serial","amr"]].rename(
                 columns={"stand":"Stand","unit_type":"Block","wbho_section":"DB/Block","serial":"Serial","amr":"AMR"})
             st.dataframe(disp, use_container_width=True, hide_index=True)
+
+
+# =====================================================================
+# APARTMENT FLOOR PLAN TAB — schematic per PDF layouts, AMR colour-coded
+# =====================================================================
+if is_apartments and tab_floorplan is not None:
+ with tab_floorplan:
+    st.subheader("🏬 Block Floor Plans — AMR Import Status")
+    st.caption(
+        "Schematic layout per the architectural drawings: odd units north side, even units south, "
+        "three wings per floor. Colours use the same AMR import scheme as the AMR Live tab."
+    )
+
+    # ── Load current AMR readings (cache → DB fallback) ───────────────
+    _fp_readings = {}
+    _cached = load_amr_cache()
+    if _cached and _cached.get("readings"):
+        _fp_readings = _cached["readings"]
+    if not _fp_readings:
+        _fp_readings = load_latest_from_db()
+
+    # ── Meter type selector ────────────────────────────────────────────
+    fp_type = st.radio(
+        "Meter type", ["Electrical", "Water (Cold)", "Water (Hot)"],
+        horizontal=True, key="fp_meter_type"
+    )
+
+    # serial lookup for the chosen type: stand → serial
+    _fp_df = df[df["meter_type"] == fp_type]
+    serial_by_stand = dict(zip(_fp_df["stand"], _fp_df["serial"]))
+    amr_flag_by_stand = dict(zip(_fp_df["stand"], _fp_df["amr"]))
+
+    import re as _re_fp
+    import json as _json_fp
+
+    BLOCK_NAMES = {"A": "Block A · Helderberg Suites", "B": "Block B · Tafelberg Suites"}
+    FLOOR_LABEL = {"00": "Ground Floor", "01": "First Floor", "02": "Second Floor"}
+
+    # Build per-block, per-floor unit structures
+    blocks_fp = {}
+    for stand in df["stand"].unique():
+        m = _re_fp.match(r"Aprt BL ([AB])/(\d+)/(\d+)", str(stand))
+        if not m:
+            continue
+        blk, floor, unit = m.group(1), m.group(2), int(m.group(3))
+        serial = str(serial_by_stand.get(stand, "") or "")
+        amr_fitted = bool(amr_flag_by_stand.get(stand, False))
+        reading = _fp_readings.get(serial) if serial else None
+        rd_iso  = reading.get("reading_date") if reading else None
+        label, color, badge = amr_status_info(rd_iso)
+        if not amr_fitted:
+            color, label, badge = "#33415c", "AMR not fitted", "amr-nofit"
+        last_val = reading.get("reading_value") if reading else None
+        blocks_fp.setdefault(blk, {}).setdefault(floor, []).append({
+            "unit": unit,
+            "unit_str": m.group(3),
+            "stand": stand,
+            "serial": serial,
+            "color": color,
+            "label": label,
+            "value": last_val,
+            "low_bat": int(reading.get("low_battery", 0)) if reading else 0,
+        })
+
+    fp_json = _json_fp.dumps({
+        "blocks": [
+            {
+                "id": blk,
+                "name": BLOCK_NAMES.get(blk, f"Block {blk}"),
+                "floors": [
+                    {
+                        "id": fl,
+                        "label": FLOOR_LABEL.get(fl, fl),
+                        "units": sorted(blocks_fp[blk][fl], key=lambda u: u["unit"]),
+                    }
+                    for fl in sorted(blocks_fp[blk].keys(), reverse=True)  # Second → Ground, top-down like a building
+                ],
+            }
+            for blk in sorted(blocks_fp.keys())
+        ],
+        "unit_suffix": fp_type,
+    })
+
+    fp_html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>
+*{{box-sizing:border-box;margin:0;padding:0;}}
+body{{font-family:'IBM Plex Mono','Courier New',monospace;background:#0e1117;color:#e0e0e0;padding:10px;}}
+.block-wrap{{margin-bottom:34px;}}
+.block-title{{font-size:15px;font-weight:700;color:#c8d8eb;margin-bottom:2px;}}
+.block-sub{{font-size:10px;color:#5B86B3;margin-bottom:12px;}}
+.floor{{margin-bottom:16px;}}
+.floor-label{{font-size:10px;color:#7A96B2;text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px;}}
+.floor-body{{background:#131c2b;border:1.5px solid #26364d;border-radius:8px;padding:8px 10px;}}
+.row{{display:flex;gap:3px;align-items:center;margin:2px 0;}}
+.row-label{{font-size:8px;color:#44586f;width:34px;flex-shrink:0;}}
+.wing-gap{{width:22px;flex-shrink:0;display:flex;align-items:center;justify-content:center;}}
+.wing-gap::after{{content:'';width:2px;height:20px;background:#26364d;border-radius:1px;}}
+.unit{{width:34px;height:24px;border-radius:4px;display:flex;align-items:center;justify-content:center;
+       font-size:8.5px;font-weight:700;color:#fff;cursor:default;position:relative;
+       text-shadow:0 0 3px rgba(0,0,0,.7);flex-shrink:0;}}
+.unit.lowbat{{outline:2px dashed #FFF176;outline-offset:-2px;}}
+.unit:hover .tip{{display:block;}}
+.tip{{display:none;position:absolute;bottom:110%;left:50%;transform:translateX(-50%);
+     background:#0a0f18;border:1px solid #3a4f6a;border-radius:6px;padding:6px 9px;
+     font-size:9px;font-weight:400;color:#c8d8eb;white-space:nowrap;z-index:50;
+     box-shadow:0 4px 14px rgba(0,0,0,.6);text-shadow:none;}}
+.passage{{height:8px;display:flex;align-items:center;padding:0 40px;}}
+.passage-line{{flex:1;border-top:1px dashed #33415c;position:relative;}}
+.passage-text{{position:absolute;top:-6px;left:50%;transform:translateX(-50%);
+              font-size:7px;color:#44586f;background:#131c2b;padding:0 6px;letter-spacing:.15em;}}
+.legend{{display:flex;flex-wrap:wrap;gap:14px;font-size:10px;margin-top:6px;padding:8px 2px;}}
+.lg-item{{display:flex;align-items:center;gap:4px;}}
+.lg-swatch{{width:12px;height:12px;border-radius:3px;display:inline-block;}}
+</style></head><body>
+<div id="root"></div>
+<div class="legend">
+  <span class="lg-item"><span class="lg-swatch" style="background:#2E7D52"></span>Imported &lt;24h</span>
+  <span class="lg-item"><span class="lg-swatch" style="background:#D4AC0D"></span>1–3 days</span>
+  <span class="lg-item"><span class="lg-swatch" style="background:#E67E22"></span>4–7 days</span>
+  <span class="lg-item"><span class="lg-swatch" style="background:#BD4B2C"></span>7+ days</span>
+  <span class="lg-item"><span class="lg-swatch" style="background:#607080"></span>AMR fitted, never seen</span>
+  <span class="lg-item"><span class="lg-swatch" style="background:#33415c"></span>AMR not fitted</span>
+  <span class="lg-item"><span class="lg-swatch" style="outline:2px dashed #FFF176;outline-offset:-2px;background:transparent"></span>Low battery</span>
+</div>
+<script>
+const data = {fp_json};
+const root = document.getElementById('root');
+
+// wings: units 1-14 | 15-28 | 29-42
+function wingOf(u){{ const n = u % 100; return n <= 14 ? 0 : n <= 28 ? 1 : 2; }}
+
+data.blocks.forEach(block => {{
+  const bw = document.createElement('div');
+  bw.className = 'block-wrap';
+  bw.innerHTML = `<div class="block-title">🏢 ${{block.name}}</div>
+    <div class="block-sub">${{data.unit_suffix}} meters · hover a unit for serial &amp; last import</div>`;
+
+  block.floors.forEach(floor => {{
+    const f = document.createElement('div');
+    f.className = 'floor';
+    f.innerHTML = `<div class="floor-label">${{floor.label}}</div>`;
+    const body = document.createElement('div');
+    body.className = 'floor-body';
+
+    const odd  = floor.units.filter(u => u.unit % 2 === 1);
+    const even = floor.units.filter(u => u.unit % 2 === 0);
+
+    function buildRow(units, labelTxt) {{
+      const row = document.createElement('div');
+      row.className = 'row';
+      const lbl = document.createElement('span');
+      lbl.className = 'row-label';
+      lbl.textContent = labelTxt;
+      row.appendChild(lbl);
+      let lastWing = -1;
+      units.forEach(u => {{
+        const w = wingOf(u.unit);
+        if (lastWing !== -1 && w !== lastWing) {{
+          const gap = document.createElement('span');
+          gap.className = 'wing-gap';
+          row.appendChild(gap);
+        }}
+        lastWing = w;
+        const cell = document.createElement('span');
+        cell.className = 'unit' + (u.low_bat ? ' lowbat' : '');
+        cell.style.background = u.color;
+        cell.innerHTML = `${{u.unit_str}}<span class="tip">
+          <b>${{u.stand}}</b><br>Serial: ${{u.serial || '—'}}<br>${{u.label}}
+          ${{u.value !== null && u.value !== undefined ? '<br>Reading: ' + u.value : ''}}
+          ${{u.low_bat ? '<br>🔋 Low battery' : ''}}</span>`;
+        row.appendChild(cell);
+      }});
+      return row;
+    }}
+
+    body.appendChild(buildRow(odd, 'ODD'));
+    const pass = document.createElement('div');
+    pass.className = 'passage';
+    pass.innerHTML = '<div class="passage-line"><span class="passage-text">PASSAGE</span></div>';
+    body.appendChild(pass);
+    body.appendChild(buildRow(even, 'EVEN'));
+
+    f.appendChild(body);
+    bw.appendChild(f);
+  }});
+  root.appendChild(bw);
+}});
+</script></body></html>"""
+
+    components.html(fp_html, height=1050, scrolling=True)
