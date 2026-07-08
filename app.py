@@ -707,7 +707,8 @@ def load_aprt_reticulation(file_path, _mtime):
     return hierarchy
 
 
-
+@st.cache_data(show_spinner=False)
+def load_kiosk_data(file_path, _mtime):
     """Build the minisub → kiosk → meters hierarchy for the reticulation diagram."""
     xls = pd.ExcelFile(file_path)
 
