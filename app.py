@@ -1084,6 +1084,21 @@ def show_table(view_df, columns, rename, sort_col=None, ascending=True):
     )
 
 
+def summary_counters(view_df, full_df, label):
+    """Shows total counts for this category, plus a water/electrical split,
+    and how many remain after the filters above are applied."""
+    total_in_category = len(full_df)
+    water_n = int((full_df["meter_type"] == "Water").sum())
+    elec_n  = int((full_df["meter_type"] == "Electrical").sum())
+    shown_n = len(view_df)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(f"Total {label}", total_in_category)
+    c2.metric("Water", water_n)
+    c3.metric("Electrical", elec_n)
+    c4.metric("Matching current filters", shown_n)
+
+
 # ---------- Load data ----------
 st.title("🔧 Sitari Evergreen — Meter Commissioning")
 st.caption("Erf 1186 Sitari · Lifestyle Retirement Village")
