@@ -157,6 +157,7 @@ def db_get_history(serial):
         df["reading_date"] = pd.to_datetime(df["reading_date"], errors="coerce")
     return df
 
+@st.cache_data(ttl=30, show_spinner=False)
 def db_stats():
     """Return (total_rows, distinct_serials, min_date, max_date) from DB."""
     try:
@@ -755,6 +756,51 @@ def stand_map_color(stand_str, df, faulty_mode=False):
     if not due_soon.empty:
         return "#D4AC0D", 0.80, "Due soon"
     return "#3A5068", 0.55, "On track"
+
+
+# ── Cached map HTML renderers ──────────────────────────────────────────────────
+# These wrap the folium builders and cache the rendered HTML string so that
+# filter changes don't rebuild hundreds of polygons from scratch on every rerun.
+
+def _poly_hash(polygons, kiosks, minisubs=()):
+    """Stable string key for KML geometry (only changes when KML file changes)."""
+    import hashlib, json
+    data = {"p": [(p["name"], p["coords"][0]) for p in polygons[:5]],
+            "k": [k["name"] for k in kiosks],
+            "n": len(polygons)}
+    return hashlib.md5(json.dumps(data, default=str).encode()).hexdigest()[:16]
+
+def _df_hash(df):
+    """Fast hash of a DataFrame's content."""
+    import hashlib
+    return hashlib.md5(pd.util.hash_pandas_object(df, index=False).values.tobytes()).hexdigest()[:16]
+
+def _amr_hash(amr_readings):
+    """Hash of the AMR readings dict (keyed on serial → date pairs)."""
+    import hashlib, json
+    snapshot = sorted((k, v.get("reading_date","")) for k, v in amr_readings.items())
+    return hashlib.md5(json.dumps(snapshot[:50]).encode()).hexdigest()[:16]
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def cached_estate_map_html(geom_hash, df_hash_val, center, show_labels, faulty_mode,
+                            _polygons, _kiosks, _minisubs, _df):
+    """Build estate map and return HTML. Cache key excludes underscore-prefixed args."""
+    m = build_estate_map(_polygons, _kiosks, _minisubs, _df, center, show_labels, faulty_mode)
+    return m.get_root().render()
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def cached_amr_map_html(geom_hash, df_hash_val, amr_hash_val, faulty_hash_val, center,
+                         _polygons, _kiosks, _df, _amr_readings, _faulty_df):
+    """Build AMR map and return HTML. Cache key excludes underscore-prefixed args."""
+    m = build_amr_map(_polygons, _kiosks, _df, _amr_readings, _faulty_df, center)
+    return m.get_root().render()
+
+
+def render_cached_map(html_str, height=640):
+    """Render a cached folium HTML string via st.components."""
+    components.html(html_str, height=height, scrolling=False)
 
 
 def build_estate_map(polygons, kiosks, minisubs, df, center, show_labels=True, faulty_mode=False):
@@ -2055,17 +2101,18 @@ with tab_map:
                 for k in kiosks
             ]
 
-            with st.spinner("Building map\u2026"):
-                m = build_estate_map(
-                    polygons,
-                    kiosks_with_stands if show_kiosks_map else [],
-                    minisubs if show_minisubs else [],
-                    map_df,
-                    center,
-                    show_stand_labels,
-                    faulty_mode,
+            _kw = kiosks_with_stands if show_kiosks_map else []
+            _ms = minisubs if show_minisubs else []
+            _gh = _poly_hash(polygons, _kw, _ms)
+            _dh = _df_hash(map_df)
+            _fh = str(faulty_mode) + str(show_stand_labels)
+
+            with st.spinner("Building map…"):
+                map_html = cached_estate_map_html(
+                    _gh, _dh + _fh, center, show_stand_labels, faulty_mode,
+                    polygons, _kw, _ms, map_df
                 )
-                st_folium(m, use_container_width=True, height=660, returned_objects=[])
+                render_cached_map(map_html, height=660)
 
             st.caption(
                 "Satellite imagery: Esri World Imagery. "
@@ -2498,19 +2545,20 @@ with tab_amr:
                 _amr_map_df = df[df["meter_type"].isin(a_type)]
 
             _center = kml_center(_amr_polygons, _amr_kiosks, [])
-            with st.spinner("Building AMR map…"):
-                _m = build_amr_map(_amr_polygons, _amr_kiosks, _amr_map_df, amr_readings, faulty_pending_df, _center)
-                map_result = st_folium(_m, use_container_width=True, height=620,
-                                       returned_objects=["last_object_clicked_popup"])
+            _gh  = _poly_hash(_amr_polygons, _amr_kiosks)
+            _dh  = _df_hash(_amr_map_df)
+            _ah  = _amr_hash(amr_readings)
+            _fph = str(sorted(faulty_pending_df["stand"].tolist())) if not faulty_pending_df.empty else ""
 
-            # Detect stand from clicked popup
-            clicked_popup = (map_result or {}).get("last_object_clicked_popup") or ""
+            with st.spinner("Building AMR map…"):
+                amr_map_html = cached_amr_map_html(
+                    _gh, _dh, _ah, _fph, _center,
+                    _amr_polygons, _amr_kiosks, _amr_map_df, amr_readings, faulty_pending_df
+                )
+                render_cached_map(amr_map_html, height=620)
+
+            # Stand selection via dropdown only (no st_folium click overhead)
             auto_stand = None
-            if clicked_popup:
-                import re as _re
-                _m2 = _re.search(r"Stand ID:\s*(\w+)", str(clicked_popup))
-                if _m2:
-                    auto_stand = _m2.group(1)
 
             # AMR map legend
             leg_items = [
