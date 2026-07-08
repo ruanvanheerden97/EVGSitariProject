@@ -268,6 +268,78 @@ def fetch_amr_from_sftp(host, port, username, password, directory, _cache_bust=0
         return {}, None, None, str(e)
 
 
+def fetch_amr_bulk_history(host, port, username, password, directory, hours=24, progress_cb=None):
+    """
+    Connect to SFTP, download ALL CSV files whose filename timestamp falls within
+    the last `hours` hours, parse each, and upsert into the history DB.
+    Returns (files_processed, new_readings_inserted, latest_readings_dict, error_str).
+    `progress_cb(current, total, filename)` is called for each file if provided.
+    Not cached — intended for one-off bulk historical loads.
+    """
+    if not PARAMIKO_AVAILABLE:
+        return 0, 0, {}, "paramiko not installed"
+    try:
+        transport = paramiko.Transport((host, int(port)))
+        transport.connect(username=username, password=password)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+
+        try:
+            files = sftp.listdir(directory)
+        except FileNotFoundError:
+            transport.close()
+            return 0, 0, {}, f"Directory not found: {directory}"
+
+        csv_files = [f for f in files if f.lower().endswith(".csv")]
+        if not csv_files:
+            transport.close()
+            return 0, 0, {}, "No CSV files found in directory"
+
+        cutoff = datetime.now() - timedelta(hours=hours)
+
+        def ts_key(name):
+            ts = _parse_csv_filename_ts(name)
+            return ts if ts else datetime.min
+
+        # Filter to files within the window, newest first
+        in_window = sorted(
+            [f for f in csv_files if ts_key(f) >= cutoff],
+            key=ts_key, reverse=True
+        )
+
+        if not in_window:
+            transport.close()
+            return 0, 0, {}, f"No CSV files found within the last {hours} hours"
+
+        files_done = 0
+        total_new  = 0
+        latest_readings = {}
+
+        for i, fname in enumerate(in_window):
+            if progress_cb:
+                progress_cb(i + 1, len(in_window), fname)
+
+            file_ts = _parse_csv_filename_ts(fname)
+            remote_path = directory.rstrip("/") + "/" + fname
+            try:
+                buf = io.BytesIO()
+                sftp.getfo(remote_path, buf)
+                readings = parse_amr_csv(buf.getvalue(), file_ts)
+                n = db_upsert_readings(readings, file_ts.isoformat() if file_ts else None)
+                total_new += n
+                files_done += 1
+                # Keep the readings from the most recent file as the "current" snapshot
+                if i == 0:
+                    latest_readings = readings
+            except Exception:
+                continue  # skip corrupt / unreadable files silently
+
+        transport.close()
+        return files_done, total_new, latest_readings, None
+
+    except Exception as e:
+        return 0, 0, {}, str(e)
+
+
 def load_amr_cache():
     """Load persisted AMR readings from local JSON cache file."""
     if os.path.exists(AMR_CACHE_FILE):
@@ -2168,9 +2240,17 @@ with tab_amr:
         type=["csv"], key="amr_csv_upload"
     )
 
-    col_fetch, col_last = st.columns([1, 3])
+    col_fetch, col_bulk, col_hours, col_last = st.columns([1, 1.2, 0.8, 2])
     with col_fetch:
         fetch_clicked = st.button("🔄 Fetch latest from SFTP", disabled=not sftp_ready, key="amr_fetch_btn")
+    with col_hours:
+        bulk_hours = st.number_input("Hours back", min_value=1, max_value=168, value=24,
+                                     key="amr_bulk_hours", label_visibility="collapsed",
+                                     help="How many hours back to fetch for history population")
+    with col_bulk:
+        bulk_clicked = st.button(f"📥 Fetch last {bulk_hours}h (history)", disabled=not sftp_ready,
+                                 key="amr_bulk_btn",
+                                 help="Downloads ALL CSV files in the SFTP directory within the selected window and stores them in the history database.")
 
     if uploaded_amr is not None:
         raw = uploaded_amr.read()
@@ -2184,6 +2264,38 @@ with tab_amr:
             pass
         save_amr_cache({"readings": amr_readings, "source": amr_source,
                         "file_ts": fname_ts.isoformat() if fname_ts else None})
+
+    elif bulk_clicked and sftp_ready:
+        progress_bar  = st.progress(0, text="Connecting to SFTP…")
+        status_text   = st.empty()
+
+        def _progress(current, total, fname):
+            pct = int(current / total * 100)
+            progress_bar.progress(pct, text=f"Fetching file {current}/{total}: {fname}")
+            status_text.caption(f"Processing: **{fname}**")
+
+        files_done, new_rows, latest_rdgs, bulk_err = fetch_amr_bulk_history(
+            sftp_host, int(sftp_port), sftp_user, sftp_pass, sftp_dir,
+            hours=int(bulk_hours), progress_cb=_progress
+        )
+        progress_bar.empty()
+        status_text.empty()
+
+        if bulk_err:
+            st.error(f"SFTP error: {bulk_err}")
+        else:
+            total_rows, distinct_serials, mn, mx = db_stats()
+            st.success(
+                f"✅ Fetched **{files_done}** files from the last {bulk_hours}h · "
+                f"**{new_rows}** new readings added to history DB · "
+                f"DB now holds **{total_rows:,}** readings across **{distinct_serials}** serials "
+                f"({mn[:10] if mn else '—'} → {mx[:10] if mx else '—'})"
+            )
+            if latest_rdgs:
+                amr_readings = latest_rdgs
+                amr_source   = f"SFTP bulk ({bulk_hours}h)"
+                amr_file_ts  = None
+                save_amr_cache({"readings": amr_readings, "source": amr_source, "file_ts": None})
 
     elif fetch_clicked and sftp_ready:
         import time
@@ -2210,7 +2322,7 @@ with tab_amr:
             amr_file_ts  = datetime.fromisoformat(raw_ts) if raw_ts else None
 
     # Auto-fetch on page load if SFTP configured and no data yet
-    if not amr_readings and sftp_ready and not fetch_clicked:
+    if not amr_readings and sftp_ready and not fetch_clicked and not bulk_clicked:
         import time
         cache_bust = int(time.time() // 3600)
         with st.spinner("Auto-fetching latest readings from SFTP…"):
