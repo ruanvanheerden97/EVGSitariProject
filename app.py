@@ -127,6 +127,9 @@ def load_data(file_path, _mtime):
         out["commission_date"] = pd.to_datetime(coalesce_col(wdf, ["Meter Commissioning Date", "Meter Commission Date"]), errors="coerce")
         out["amr"] = coalesce_col(wdf, ["AMR Commissioned"]).fillna(False).astype(bool)
         out["deadline"] = pd.to_datetime(coalesce_col(wdf, ["Snag Date 4"]), errors="coerce")
+        out["faulty"] = coalesce_col(wdf, ["Faulty Meter"]).fillna(False).astype(bool)
+        out["faulty_replaced"] = coalesce_col(wdf, ["Faulty Replaced"]).fillna(False).astype(bool)
+        out["replacement_date"] = pd.to_datetime(coalesce_col(wdf, ["Replacement Date"]), errors="coerce")
         out["meter_type"] = "Water"
         out = out[out["stand"].notna() & (out["stand"] != "") & (out["stand"].str.lower() != "none")]
         records.append(out)
@@ -144,6 +147,9 @@ def load_data(file_path, _mtime):
         out["commission_date"] = pd.to_datetime(coalesce_col(edf, ["Meter Commission Date", "Meter Commissioning Date"]), errors="coerce")
         out["amr"] = coalesce_col(edf, ["AMR Installed"]).fillna(False).astype(bool)
         out["deadline"] = pd.to_datetime(coalesce_col(edf, ["Snag Date 4"]), errors="coerce")
+        out["faulty"] = coalesce_col(edf, ["Faulty Meter"]).fillna(False).astype(bool)
+        out["faulty_replaced"] = coalesce_col(edf, ["Faulty Replaced"]).fillna(False).astype(bool)
+        out["replacement_date"] = pd.to_datetime(coalesce_col(edf, ["Replacement Date"]), errors="coerce")
         out["meter_type"] = "Electrical"
         out = out[out["stand"].notna() & (out["stand"] != "") & (out["stand"].str.lower() != "none")]
         records.append(out)
@@ -425,11 +431,23 @@ def parse_kml(kml_bytes):
     return polygons, kiosks, minisubs
 
 
-def stand_map_color(stand_str, df):
+def stand_map_color(stand_str, df, faulty_mode=False):
     """Return (fill_color, opacity, status_label) for a stand."""
     rows = df[df["stand"] == stand_str]
     if rows.empty:
         return "#607080", 0.35, "No data"
+
+    # Faulty overlay mode — colour by fault status instead of install status
+    if faulty_mode:
+        faulty_rows = rows[rows["faulty"]] if "faulty" in rows.columns else pd.DataFrame()
+        if not faulty_rows.empty:
+            replaced = faulty_rows["faulty_replaced"].any() if "faulty_replaced" in faulty_rows.columns else False
+            if replaced:
+                return "#8B5CF6", 0.85, "Faulty — replaced"        # purple
+            else:
+                return "#EF4444", 0.90, "Faulty — awaiting replacement"  # bright red
+        return "#1E3A2F", 0.30, "No fault recorded"   # very dark, recede into background
+
     elec  = rows[rows["meter_type"] == "Electrical"]
     water = rows[rows["meter_type"] == "Water"]
     elec_inst  = bool(elec["installed"].any())  if not elec.empty  else False
@@ -453,7 +471,7 @@ def stand_map_color(stand_str, df):
     return "#3A5068", 0.55, "On track"
 
 
-def build_estate_map(polygons, kiosks, minisubs, df, center, show_labels=True):
+def build_estate_map(polygons, kiosks, minisubs, df, center, show_labels=True, faulty_mode=False):
     m = folium.Map(location=center, zoom_start=19, tiles=None,
                    max_zoom=22, zoom_control=True)
     folium.TileLayer(
@@ -470,10 +488,27 @@ def build_estate_map(polygons, kiosks, minisubs, df, center, show_labels=True):
     # ── Unit polygons ─────────────────────────────────────────────────
     for poly in polygons:
         stand = poly["name"].strip()
-        color, opacity, status_label = stand_map_color(stand, df)
+        color, opacity, status_label = stand_map_color(stand, df, faulty_mode)
         rows = df[df["stand"] == stand]
         elec  = rows[rows["meter_type"] == "Electrical"]
         water = rows[rows["meter_type"] == "Water"]
+
+        # Faulty badge for popup
+        faulty_rows = rows[rows["faulty"]] if "faulty" in rows.columns else pd.DataFrame()
+        faulty_badge = ""
+        if not faulty_rows.empty:
+            replaced = faulty_rows["faulty_replaced"].any()
+            repl_date = faulty_rows["replacement_date"].dropna()
+            repl_str = repl_date.iloc[0].strftime("%d %b %Y") if not repl_date.empty else ""
+            if replaced:
+                faulty_badge = (f"<div style='margin:4px 0 6px;padding:3px 10px;border-radius:6px;"
+                                f"background:#8B5CF622;color:#8B5CF6;border:1px solid #8B5CF688;"
+                                f"font-size:11px;font-weight:600'>✅ Faulty — replaced"
+                                f"{(' on ' + repl_str) if repl_str else ''}</div>")
+            else:
+                faulty_badge = (f"<div style='margin:4px 0 6px;padding:3px 10px;border-radius:6px;"
+                                f"background:#EF444422;color:#EF4444;border:1px solid #EF444488;"
+                                f"font-size:11px;font-weight:600'>⚠️ Faulty — awaiting replacement</div>")
 
         def _row(r_df, label):
             if r_df.empty:
@@ -499,7 +534,8 @@ def build_estate_map(polygons, kiosks, minisubs, df, center, show_labels=True):
             f"<div style='font-size:15px;font-weight:700;color:#152B45;margin-bottom:6px'>Stand {stand}</div>"
             f"<div style='display:inline-block;padding:2px 10px;border-radius:10px;font-size:11px;"
             f"font-weight:600;background:{color}22;color:{color};border:1px solid {color}88;"
-            f"margin-bottom:8px'>{status_label}</div>"
+            f"margin-bottom:6px'>{status_label}</div>"
+            f"{faulty_badge}"
             f"<table style='width:100%;font-size:12px;border-collapse:collapse;border-top:1px solid #eee'>"
             f"{_row(elec,'Electrical')}{_row(water,'Water')}"
             f"</table></div>"
@@ -734,18 +770,21 @@ overdue_n = int((df["status"] == "Overdue").sum())
 due_soon_n = int((df["status"] == "Due soon").sum())
 outstanding_n = total - installed_n
 
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Total meter points", total)
 c2.metric("Installed", installed_n, f"{round(installed_n/total*100)}% complete")
 c3.metric("Outstanding", outstanding_n)
 c4.metric("Due within 14 days", due_soon_n)
 c5.metric("Overdue", overdue_n, delta_color="inverse")
+faulty_n = int(df["faulty"].sum()) if "faulty" in df.columns else 0
+faulty_pending_n = int(df[df["faulty"] & ~df["faulty_replaced"]]["stand"].count()) if "faulty" in df.columns else 0
+c6.metric("Faulty meters", faulty_n, f"{faulty_pending_n} awaiting replacement", delta_color="inverse")
 
 st.divider()
 
 # ---------- Tabs ----------
-tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic, tab_map = st.tabs(
-    ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed", "📅 Calendar", "📊 Sections", "⚡ Reticulation", "🗺️ Estate Map"]
+tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic, tab_map, tab_faulty = st.tabs(
+    ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed", "📅 Calendar", "📊 Sections", "⚡ Reticulation", "🗺️ Estate Map", "⚠️ Faulty Meters"]
 )
 
 COLS = ["stand", "meter_type", "unit_type", "wbho_section", "deadline", "status"]
@@ -987,6 +1026,12 @@ with tab_retic:
     diagram_json = json.dumps(diagram_data)
     highlight_json = json.dumps(highlight_stands)
 
+    # Build faulty stand lookup for reticulation diagram
+    faulty_stands_set = set(df[df["faulty"]]["stand"].tolist()) if "faulty" in df.columns else set()
+    faulty_replaced_set = set(df[df["faulty"] & df["faulty_replaced"]]["stand"].tolist()) if "faulty" in df.columns else set()
+    faulty_json = json.dumps(list(faulty_stands_set))
+    faulty_replaced_json = json.dumps(list(faulty_replaced_set))
+
     html = f"""
 <!DOCTYPE html>
 <html>
@@ -1091,6 +1136,25 @@ with tab_retic:
   .stand-chip.pending {{
     background: #1F3F6622; color: #7a9ec4; border: 1px solid #334d6e;
   }}
+  .stand-chip.faulty {{
+    background: #EF444422; color: #EF4444; border: 2px solid #EF444488;
+    animation: faulty-pulse 1.8s ease-in-out infinite;
+  }}
+  .stand-chip.faulty-replaced {{
+    background: #8B5CF622; color: #A78BFA; border: 1px solid #8B5CF688;
+  }}
+  @keyframes faulty-pulse {{
+    0%, 100% {{ box-shadow: 0 0 0 0 #EF444433; }}
+    50% {{ box-shadow: 0 0 0 3px #EF444422; }}
+  }}
+  .faulty-tag {{
+    display: inline-block; font-size: 8px; padding: 0 4px; border-radius: 3px;
+    font-weight: 700; margin-left: 2px; vertical-align: middle;
+    background: #EF444422; color: #EF4444; border: 1px solid #EF444466;
+  }}
+  .faulty-tag.replaced {{
+    background: #8B5CF622; color: #A78BFA; border: 1px solid #8B5CF666;
+  }}
   .amr-dot {{
     display: inline-block; width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
   }}
@@ -1156,6 +1220,8 @@ with tab_retic:
   <div class="legend-item"><span class="legend-swatch" style="background:#1F3F6633;border:1px solid #334d6e"></span><span style="color:#7a9ec4">Meter not yet installed</span></div>
   <div class="legend-item"><span class="dl-badge dl-overdue" style="display:inline-block">OVR</span><span style="color:#e07060;margin-left:4px">Past Snag Date 4</span></div>
   <div class="legend-item"><span class="dl-badge dl-due-soon" style="display:inline-block">DUE</span><span style="color:#d4902a;margin-left:4px">Due within 14 days</span></div>
+  <div class="legend-item"><span class="faulty-tag" style="display:inline-block">FLT</span><span style="color:#EF4444;margin-left:4px">Faulty — awaiting replacement</span></div>
+  <div class="legend-item"><span class="faulty-tag replaced" style="display:inline-block">RPLC</span><span style="color:#A78BFA;margin-left:4px">Faulty — replaced</span></div>
 </div>
 
 <div class="supply-bus">
@@ -1169,6 +1235,8 @@ with tab_retic:
 <script>
 const data = {diagram_json};
 const highlightStands = new Set({highlight_json});
+const faultyStands = new Set({faulty_json});
+const faultyReplacedStands = new Set({faulty_replaced_json});
 const popup = document.getElementById('serialPopup');
 
 function pct(inst, plan) {{
@@ -1313,15 +1381,29 @@ function buildDiagram() {{
           const isOverdue = overduSet.has(s);
           const isDueSoon = dueSoonSet.has(s);
           const dlInfo = deadlineMap[s] || null;
+          const isFaulty = faultyStands.has(s);
+          const isFaultyReplaced = faultyReplacedStands.has(s);
 
           let cls = 'stand-chip pending';
-          if (inst && amr) cls = 'stand-chip';
+          if (isFaulty && !isFaultyReplaced) cls = 'stand-chip faulty';
+          else if (isFaulty && isFaultyReplaced) cls = 'stand-chip faulty-replaced';
+          else if (inst && amr) cls = 'stand-chip';
           else if (inst) cls = 'stand-chip no-amr';
           if (isHighlight) cls += ' highlight';
 
-          const dot = inst
-            ? `<span class="amr-dot ${{amr ? 'ok' : 'missing'}}"></span>`
-            : `<span class="amr-dot" style="background:#334d6e"></span>`;
+          const dot = isFaulty
+            ? (isFaultyReplaced
+                ? `<span class="amr-dot" style="background:#8B5CF6"></span>`
+                : `<span class="amr-dot" style="background:#EF4444"></span>`)
+            : inst
+              ? `<span class="amr-dot ${{amr ? 'ok' : 'missing'}}"></span>`
+              : `<span class="amr-dot" style="background:#334d6e"></span>`;
+
+          const faultyBadge = isFaulty
+            ? (isFaultyReplaced
+                ? `<span class="faulty-tag replaced">RPLC</span>`
+                : `<span class="faulty-tag">FLT</span>`)
+            : '';
 
           const dlBadge = !inst && isOverdue
             ? `<span class="dl-badge dl-overdue">OVR</span>`
@@ -1330,13 +1412,16 @@ function buildDiagram() {{
               : '';
 
           const dlTitle = dlInfo ? ` · Deadline: ${{dlInfo.deadline}} (${{dlInfo.days_to < 0 ? Math.abs(dlInfo.days_to) + 'd overdue' : dlInfo.days_to + 'd remaining'}})` : '';
+          const faultyTitle = isFaulty ? ` ⚠️ FAULTY${{isFaultyReplaced ? ' (replaced)' : ' - awaiting replacement'}}` : '';
           const title = inst
-            ? `Stand ${{s}} · Serial: ${{serial || 'not recorded'}} · AMR: ${{amr ? '✓' : 'pending'}}`
-            : `Stand ${{s}} · Not installed${{dlTitle}}`;
+            ? `Stand ${{s}} · Serial: ${{serial || 'not recorded'}} · AMR: ${{amr ? '✓' : 'pending'}}${{faultyTitle}}`
+            : `Stand ${{s}} · Not installed${{dlTitle}}${{faultyTitle}}`;
 
-          return `<span class="${{cls}}" data-stand="${{s}}" data-serial="${{serial}}" data-inst="${{inst}}" data-amr="${{amr}}" data-deadline="${{dlInfo ? dlInfo.deadline : ''}}" data-days="${{dlInfo ? dlInfo.days_to : ''}}" data-dlstatus="${{dlInfo ? dlInfo.status : ''}}" title="${{title}}">${{dot}}${{s}}${{dlBadge}}</span>`;
+          return `<span class="${{cls}}" data-stand="${{s}}" data-serial="${{serial}}" data-inst="${{inst}}" data-amr="${{amr}}" data-deadline="${{dlInfo ? dlInfo.deadline : ''}}" data-days="${{dlInfo ? dlInfo.days_to : ''}}" data-dlstatus="${{dlInfo ? dlInfo.status : ''}}" title="${{title}}">${{dot}}${{s}}${{faultyBadge}}${{dlBadge}}</span>`;
         }}).join('');
         const amrMissing = k.installed - k.amr_count;
+        const faultyInKiosk = k.stands ? k.stands.filter(s => faultyStands.has(s)).length : 0;
+        const faultyReplacedInKiosk = k.stands ? k.stands.filter(s => faultyReplacedStands.has(s)).length : 0;
         detail.innerHTML = `
           <div style="font-size:9px;color:#5B86B3;margin-bottom:4px;">
             STANDS (${{k.stands.length}} in sheet · ${{k.planned}} planned)
@@ -1344,6 +1429,7 @@ function buildDiagram() {{
             ${{amrMissing > 0 ? '&nbsp;·&nbsp; <span class="amr-miss-count">AMR pending: ' + amrMissing + '</span>' : ''}}
             ${{(k.overdue_stands||[]).length > 0 ? '&nbsp;·&nbsp; <span style="color:#e07060">🟥 ' + k.overdue_stands.length + ' overdue</span>' : ''}}
             ${{(k.due_soon_stands||[]).length > 0 ? '&nbsp;·&nbsp; <span style="color:#d4902a">🟧 ' + k.due_soon_stands.length + ' due soon</span>' : ''}}
+            ${{faultyInKiosk > 0 ? '&nbsp;·&nbsp; <span style="color:#EF4444">⚠️ ' + faultyInKiosk + ' faulty (' + faultyReplacedInKiosk + ' replaced)</span>' : ''}}
           </div>
           <div class="stand-grid">${{chipsHtml}}</div>
           ${{k.comment && k.comment !== 'nan' ? '<div class="comment-tag">📌 ' + k.comment + '</div>' : ''}}
@@ -1457,7 +1543,7 @@ with tab_map:
             )
 
             # ── Controls ────────────────────────────────────────────────
-            col_a, col_b, col_c = st.columns(3)
+            col_a, col_b, col_c, col_d = st.columns(4)
             with col_a:
                 map_meter_type = st.radio(
                     "Colour polygons by", ["Both meters", "Electrical only", "Water only"],
@@ -1468,6 +1554,11 @@ with tab_map:
                 show_minisubs    = st.checkbox("Show minisub markers", value=True, key="map_show_ms")
             with col_c:
                 show_stand_labels = st.checkbox("Show stand number labels", value=True, key="map_stand_labels")
+            with col_d:
+                faulty_mode = st.checkbox(
+                    "⚠️ Highlight faulty meters", value=False, key="map_faulty_mode",
+                    help="Switch polygon colours to show fault status: red = faulty awaiting replacement, purple = replaced, dark = no fault."
+                )
 
             map_df = df.copy()
             if map_meter_type == "Electrical only":
@@ -1476,15 +1567,22 @@ with tab_map:
                 map_df = df[df["meter_type"] == "Water"]
 
             # ── Legend ──────────────────────────────────────────────────
-            legend_items = [
-                ("#2E7D52", "Meter \u2713 \u00b7 AMR \u2713"),
-                ("#E69138", "Meters \u2713 \u00b7 AMR pending"),
-                ("#5B86B3", "Partially installed"),
-                ("#BD4B2C", "Overdue"),
-                ("#D4AC0D", "Due soon"),
-                ("#3A5068", "On track"),
-                ("#607080", "No data"),
-            ]
+            if faulty_mode:
+                legend_items = [
+                    ("#EF4444", "Faulty \u2014 awaiting replacement"),
+                    ("#8B5CF6", "Faulty \u2014 replaced"),
+                    ("#1E3A2F", "No fault recorded"),
+                ]
+            else:
+                legend_items = [
+                    ("#2E7D52", "Meter \u2713 \u00b7 AMR \u2713"),
+                    ("#E69138", "Meters \u2713 \u00b7 AMR pending"),
+                    ("#5B86B3", "Partially installed"),
+                    ("#BD4B2C", "Overdue"),
+                    ("#D4AC0D", "Due soon"),
+                    ("#3A5068", "On track"),
+                    ("#607080", "No data"),
+                ]
             lg = "<div style=\'display:flex;flex-wrap:wrap;gap:10px;padding:6px 0;font-size:12px;align-items:center;\'>"
             for color, label in legend_items:
                 lg += (f"<div style=\'display:flex;align-items:center;gap:5px;\'>"
@@ -1536,6 +1634,7 @@ with tab_map:
                     map_df,
                     center,
                     show_stand_labels,
+                    faulty_mode,
                 )
                 st_folium(m, use_container_width=True, height=660, returned_objects=[])
 
@@ -1544,3 +1643,121 @@ with tab_map:
                 "Click any house polygon to see meter and AMR status. "
                 "Commit an updated KML to the repo to refresh the map."
             )
+
+# =====================================================================
+# FAULTY METERS TAB
+# =====================================================================
+with tab_faulty:
+    st.subheader("⚠️ Faulty Meter Log")
+    st.caption(
+        "All meters flagged as faulty in the spreadsheet. "
+        "Update **Faulty Meter**, **Faulty Replaced**, and **Replacement Date** "
+        "columns in the Excel sheet and push to refresh."
+    )
+
+    faulty_df = df[df["faulty"]].copy() if "faulty" in df.columns else pd.DataFrame()
+
+    if faulty_df.empty:
+        st.success("No meters currently flagged as faulty.")
+    else:
+        # KPIs
+        total_faulty   = len(faulty_df)
+        replaced       = int(faulty_df["faulty_replaced"].sum())
+        pending_repl   = total_faulty - replaced
+        water_faulty   = int((faulty_df["meter_type"] == "Water").sum())
+        elec_faulty    = int((faulty_df["meter_type"] == "Electrical").sum())
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Total faulty", total_faulty)
+        k2.metric("Awaiting replacement", pending_repl)
+        k3.metric("Already replaced", replaced)
+        k4.metric("Water meters", water_faulty)
+        k5.metric("Electrical meters", elec_faulty)
+
+        st.divider()
+
+        # Filters
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            f_type = st.multiselect(
+                "Meter type", ["Water", "Electrical"],
+                default=list(faulty_df["meter_type"].unique()),
+                key="faulty_type"
+            )
+        with fc2:
+            f_status = st.multiselect(
+                "Replacement status",
+                ["Awaiting replacement", "Replaced"],
+                default=["Awaiting replacement", "Replaced"],
+                key="faulty_status"
+            )
+        with fc3:
+            f_section = st.multiselect(
+                "Section (WBHO)",
+                sorted(faulty_df["wbho_section"].dropna().unique()),
+                key="faulty_section"
+            )
+
+        view = faulty_df[faulty_df["meter_type"].isin(f_type)].copy()
+
+        status_map = []
+        if "Awaiting replacement" in f_status:
+            status_map.append(~view["faulty_replaced"])
+        if "Replaced" in f_status:
+            status_map.append(view["faulty_replaced"])
+        if status_map:
+            combined = status_map[0]
+            for m in status_map[1:]:
+                combined = combined | m
+            view = view[combined]
+
+        if f_section:
+            view = view[view["wbho_section"].isin(f_section)]
+
+        if view.empty:
+            st.info("No faulty meters match the current filters.")
+        else:
+            # Build display table
+            display = view[[
+                "stand", "meter_type", "unit_type", "wbho_section",
+                "serial", "commission_date", "faulty_replaced", "replacement_date", "manufacturer", "model"
+            ]].copy()
+
+            display["faulty_replaced"] = display["faulty_replaced"].map(
+                {True: "✅ Replaced", False: "⏳ Awaiting replacement"}
+            )
+            display["commission_date"] = pd.to_datetime(display["commission_date"]).dt.strftime("%d %b %Y")
+            display["replacement_date"] = pd.to_datetime(display["replacement_date"]).dt.strftime("%d %b %Y").fillna("—")
+
+            display.columns = [
+                "Stand", "Type", "Unit type", "Section",
+                "Original serial", "Commissioned", "Replacement status", "Replaced on",
+                "Manufacturer", "Model"
+            ]
+            display = display.sort_values(["Replacement status", "Stand"])
+
+            st.dataframe(display, use_container_width=True, hide_index=True,
+                         column_config={
+                             "Replacement status": st.column_config.TextColumn("Status", width="medium"),
+                         })
+
+            import hashlib
+            csv = display.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download faulty meter list as CSV", csv,
+                file_name="faulty_meters.csv", mime="text/csv",
+                key=f"dl_faulty_{hashlib.md5(csv).hexdigest()[:8]}"
+            )
+
+        st.divider()
+        st.markdown("##### Replacement history timeline")
+        replaced_with_date = faulty_df[faulty_df["faulty_replaced"] & faulty_df["replacement_date"].notna()]
+        if replaced_with_date.empty:
+            st.caption("No replacement dates recorded yet.")
+        else:
+            for _, row in replaced_with_date.sort_values("replacement_date").iterrows():
+                st.markdown(
+                    f"**Stand {row['stand']}** ({row['meter_type']}) — "
+                    f"original serial `{row['serial'] or '—'}` — "
+                    f"replaced {row['replacement_date'].strftime('%d %b %Y')}"
+                )
