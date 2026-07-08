@@ -1,14 +1,21 @@
 import streamlit as st
 import pandas as pd
 import calendar as cal
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import glob
 import os
 import json
+import re
+import io
 import xml.etree.ElementTree as ET
 import streamlit.components.v1 as components
 import folium
 from streamlit_folium import st_folium
+try:
+    import paramiko
+    PARAMIKO_AVAILABLE = True
+except ImportError:
+    PARAMIKO_AVAILABLE = False
 
 st.set_page_config(
     page_title="Sitari Evergreen — Meter Commissioning",
@@ -94,6 +101,146 @@ def find_kml_file():
     if not matches:
         return None
     return max(matches, key=os.path.getmtime)
+
+
+# ── AMR / SFTP helpers ────────────────────────────────────────────────────────
+
+AMR_CACHE_FILE = os.path.join(os.path.dirname(__file__), "amr_cache.json")
+CSV_FILENAME_RE = re.compile(r"^[A-Z]+_(\d{8})_(\d{6})\.csv$", re.IGNORECASE)
+
+def _parse_csv_filename_ts(name):
+    """Extract datetime from SIT_YYYYMMDD_HHMMSS.csv → datetime or None."""
+    m = CSV_FILENAME_RE.match(os.path.basename(name))
+    if m:
+        try:
+            return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+    return None
+
+def parse_amr_csv(csv_bytes_or_str, file_ts=None):
+    """
+    Parse one AMR CSV file. Returns a dict:
+      {base_serial: {reading_date, reading_value, low_battery, file_ts}}
+    Skips NR (reverse channel) rows.
+    """
+    if isinstance(csv_bytes_or_str, (bytes, bytearray)):
+        text = csv_bytes_or_str.decode("utf-8", errors="replace")
+    else:
+        text = csv_bytes_or_str
+
+    df = pd.read_csv(io.StringIO(text))
+    df.columns = [c.strip() for c in df.columns]
+
+    df["_addr"] = df["METER_ADDRESS"].astype(str).str.strip()
+    df = df[~df["_addr"].str.endswith("NR")].copy()
+
+    # Parse reading date — format "DD/MM/YYYY HH:MM:SS GMT+2"
+    df["_reading_dt"] = pd.to_datetime(
+        df["READING_DATE"].astype(str).str.replace(r"\s*GMT[+-]\d+", "", regex=True),
+        dayfirst=True, errors="coerce"
+    )
+
+    result = {}
+    for _, row in df.iterrows():
+        serial = row["_addr"]
+        if not serial or serial == "nan":
+            continue
+        result[serial] = {
+            "reading_date": row["_reading_dt"].isoformat() if pd.notna(row["_reading_dt"]) else None,
+            "reading_value": float(row["READING_VALUE"]) if pd.notna(row["READING_VALUE"]) else None,
+            "low_battery": int(row.get("LOW_BATTERY", 0) or 0),
+            "file_ts": file_ts.isoformat() if file_ts else None,
+        }
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_amr_from_sftp(host, port, username, password, directory, _cache_bust=0):
+    """
+    Connect to SFTP, find the most recent CSV in `directory`,
+    download and parse it. Returns (readings_dict, filename, file_ts, error_str).
+    Cached for 1 hour — set _cache_bust=int(time.time()//3600) to force hourly refresh.
+    """
+    if not PARAMIKO_AVAILABLE:
+        return {}, None, None, "paramiko not installed"
+    try:
+        transport = paramiko.Transport((host, int(port)))
+        transport.connect(username=username, password=password)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+
+        # List all CSV files in directory, pick the newest by filename timestamp
+        try:
+            files = sftp.listdir(directory)
+        except FileNotFoundError:
+            transport.close()
+            return {}, None, None, f"Directory not found: {directory}"
+
+        csv_files = [f for f in files if f.lower().endswith(".csv")]
+        if not csv_files:
+            transport.close()
+            return {}, None, None, "No CSV files found in directory"
+
+        # Sort by embedded timestamp in filename; fall back to mtime
+        def file_sort_key(name):
+            ts = _parse_csv_filename_ts(name)
+            return ts if ts else datetime.min
+
+        best = max(csv_files, key=file_sort_key)
+        file_ts = _parse_csv_filename_ts(best)
+
+        remote_path = directory.rstrip("/") + "/" + best
+        buf = io.BytesIO()
+        sftp.getfo(remote_path, buf)
+        transport.close()
+
+        readings = parse_amr_csv(buf.getvalue(), file_ts)
+        return readings, best, file_ts, None
+
+    except Exception as e:
+        return {}, None, None, str(e)
+
+
+def load_amr_cache():
+    """Load persisted AMR readings from local JSON cache file."""
+    if os.path.exists(AMR_CACHE_FILE):
+        try:
+            with open(AMR_CACHE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_amr_cache(data):
+    """Persist AMR readings to local JSON cache file."""
+    try:
+        with open(AMR_CACHE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+def amr_status_info(reading_date_iso):
+    """
+    Return (label, color_hex, badge_class) based on hours since last reading.
+    None reading_date → never seen.
+    """
+    if not reading_date_iso:
+        return "No reading", "#607080", "amr-never"
+    try:
+        dt = datetime.fromisoformat(reading_date_iso)
+    except ValueError:
+        return "No reading", "#607080", "amr-never"
+    hours_ago = (datetime.now() - dt).total_seconds() / 3600
+    if hours_ago <= 24:
+        return f"Last {int(hours_ago)}h ago", "#2E7D52", "amr-green"
+    if hours_ago <= 72:
+        days = hours_ago / 24
+        return f"{days:.1f}d ago", "#D4AC0D", "amr-yellow"
+    if hours_ago <= 168:
+        days = hours_ago / 24
+        return f"{days:.0f}d ago", "#E67E22", "amr-orange"
+    days = hours_ago / 24
+    return f"{days:.0f}d ago", "#BD4B2C", "amr-red"
 
 @st.cache_data(show_spinner=False)
 def load_data(file_path, _mtime):
@@ -783,8 +930,8 @@ c6.metric("Faulty meters", faulty_n, f"{faulty_pending_n} awaiting replacement",
 st.divider()
 
 # ---------- Tabs ----------
-tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic, tab_map, tab_faulty = st.tabs(
-    ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed", "📅 Calendar", "📊 Sections", "⚡ Reticulation", "🗺️ Estate Map", "⚠️ Faulty Meters"]
+tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic, tab_map, tab_faulty, tab_amr = st.tabs(
+    ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed", "📅 Calendar", "📊 Sections", "⚡ Reticulation", "🗺️ Estate Map", "⚠️ Faulty Meters", "📡 AMR Live"]
 )
 
 COLS = ["stand", "meter_type", "unit_type", "wbho_section", "deadline", "status"]
@@ -1761,3 +1908,326 @@ with tab_faulty:
                     f"original serial `{row['serial'] or '—'}` — "
                     f"replaced {row['replacement_date'].strftime('%d %b %Y')}"
                 )
+
+
+# =====================================================================
+# AMR LIVE TAB
+# =====================================================================
+with tab_amr:
+    st.subheader("📡 AMR Live — Meter Reading Status")
+    st.caption(
+        "Matches meter serials from your commissioning spreadsheet against the latest "
+        "hourly CSV file on the SFTP server. Auto-refreshes every hour on the next page load."
+    )
+
+    # ── SFTP Configuration ────────────────────────────────────────────
+    with st.expander("⚙️ SFTP Configuration", expanded="sftp_configured" not in st.session_state):
+        st.markdown(
+            "Enter your SFTP credentials below, or add them to `.streamlit/secrets.toml` "
+            "on Streamlit Cloud so they're not stored in plain text.\n\n"
+            "```toml\n[sftp]\nhost = \"sftp.example.com\"\nport = 22\n"
+            "username = \"your_user\"\npassword = \"your_pass\"\n"
+            "directory = \"/path/to/csv/files\"\n```"
+        )
+
+        # Try to load from st.secrets first
+        try:
+            sftp_defaults = st.secrets.get("sftp", {})
+        except Exception:
+            sftp_defaults = {}
+
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            sftp_host = st.text_input("SFTP Host", value=sftp_defaults.get("host", ""), key="sftp_host")
+            sftp_user = st.text_input("Username",  value=sftp_defaults.get("username", ""), key="sftp_user")
+            sftp_dir  = st.text_input("Directory", value=sftp_defaults.get("directory", ""), placeholder="/data/readings", key="sftp_dir")
+        with sc2:
+            sftp_port = st.number_input("Port", value=int(sftp_defaults.get("port", 22)), min_value=1, max_value=65535, key="sftp_port")
+            sftp_pass = st.text_input("Password", value=sftp_defaults.get("password", ""), type="password", key="sftp_pass")
+
+        sftp_ready = all([sftp_host, sftp_user, sftp_pass, sftp_dir])
+        if sftp_ready:
+            st.session_state["sftp_configured"] = True
+
+    # ── Load readings: SFTP or uploaded CSV ──────────────────────────
+    amr_readings = {}
+    amr_source   = None
+    amr_file_ts  = None
+    amr_error    = None
+
+    # Manual CSV upload as fallback / testing
+    uploaded_amr = st.file_uploader(
+        "Or upload a CSV file directly (for testing without SFTP)",
+        type=["csv"], key="amr_csv_upload"
+    )
+
+    col_fetch, col_last = st.columns([1, 3])
+    with col_fetch:
+        fetch_clicked = st.button("🔄 Fetch latest from SFTP", disabled=not sftp_ready, key="amr_fetch_btn")
+
+    if uploaded_amr is not None:
+        raw = uploaded_amr.read()
+        fname_ts = _parse_csv_filename_ts(uploaded_amr.name)
+        amr_readings = parse_amr_csv(raw, fname_ts)
+        amr_source   = f"Uploaded: {uploaded_amr.name}"
+        amr_file_ts  = fname_ts
+        save_amr_cache({"readings": amr_readings, "source": amr_source,
+                        "file_ts": fname_ts.isoformat() if fname_ts else None})
+
+    elif fetch_clicked and sftp_ready:
+        import time
+        cache_bust = int(time.time() // 3600)
+        with st.spinner("Connecting to SFTP…"):
+            amr_readings, fname, amr_file_ts, amr_error = fetch_amr_from_sftp(
+                sftp_host, int(sftp_port), sftp_user, sftp_pass, sftp_dir, cache_bust
+            )
+        if amr_error:
+            st.error(f"SFTP error: {amr_error}")
+        else:
+            amr_source = f"SFTP: {fname}"
+            save_amr_cache({"readings": amr_readings, "source": amr_source,
+                            "file_ts": amr_file_ts.isoformat() if amr_file_ts else None})
+            st.success(f"Fetched **{fname}** — {len(amr_readings)} meter readings loaded.")
+
+    else:
+        # Load from local cache (persists across restarts on self-hosted)
+        cached = load_amr_cache()
+        if cached and cached.get("readings"):
+            amr_readings = cached["readings"]
+            amr_source   = cached.get("source", "Cached data")
+            raw_ts        = cached.get("file_ts")
+            amr_file_ts  = datetime.fromisoformat(raw_ts) if raw_ts else None
+
+    # Auto-fetch on page load if SFTP configured and no data yet
+    if not amr_readings and sftp_ready and not fetch_clicked:
+        import time
+        cache_bust = int(time.time() // 3600)
+        with st.spinner("Auto-fetching latest readings from SFTP…"):
+            amr_readings, fname, amr_file_ts, amr_error = fetch_amr_from_sftp(
+                sftp_host, int(sftp_port), sftp_user, sftp_pass, sftp_dir, cache_bust
+            )
+        if not amr_error and amr_readings:
+            amr_source = f"SFTP: {fname}"
+            save_amr_cache({"readings": amr_readings, "source": amr_source,
+                            "file_ts": amr_file_ts.isoformat() if amr_file_ts else None})
+
+    with col_last:
+        if amr_source:
+            ts_str = amr_file_ts.strftime("%d %b %Y %H:%M") if amr_file_ts else "unknown time"
+            st.caption(f"📂 {amr_source} · file timestamp: **{ts_str}** · {len(amr_readings)} serials in CSV")
+        elif not sftp_ready:
+            st.caption("Configure SFTP above or upload a CSV to see readings.")
+
+    if not amr_readings:
+        st.info("No AMR data loaded yet. Configure SFTP and click 'Fetch latest', or upload a CSV file.")
+    else:
+        st.divider()
+
+        # ── Build enriched AMR table from df + readings ───────────────
+        amr_df = df[df["installed"] & df["serial"].str.len().gt(0)].copy()
+        amr_df = amr_df.drop_duplicates(subset=["stand", "meter_type"])
+
+        rows = []
+        for _, r in amr_df.iterrows():
+            serial = r["serial"]
+            reading = amr_readings.get(serial)
+            rd_iso   = reading["reading_date"]   if reading else None
+            rd_value = reading["reading_value"]  if reading else None
+            low_bat  = int(reading["low_battery"]) if reading else 0
+            label, color, badge = amr_status_info(rd_iso)
+            rows.append({
+                "stand":        r["stand"],
+                "meter_type":   r["meter_type"],
+                "unit_type":    r["unit_type"],
+                "wbho_section": r["wbho_section"],
+                "serial":       serial,
+                "amr_ok":       r["amr"],
+                "last_reading": rd_iso,
+                "reading_value":rd_value,
+                "low_battery":  low_bat,
+                "status_label": label,
+                "status_color": color,
+                "status_badge": badge,
+            })
+
+        amr_table = pd.DataFrame(rows)
+
+        # Status buckets
+        green  = amr_table[amr_table["status_badge"] == "amr-green"]
+        yellow = amr_table[amr_table["status_badge"] == "amr-yellow"]
+        orange = amr_table[amr_table["status_badge"] == "amr-orange"]
+        red    = amr_table[amr_table["status_badge"] == "amr-red"]
+        never  = amr_table[amr_table["status_badge"] == "amr-never"]
+        total_amr = len(amr_table)
+
+        # ── KPIs ──────────────────────────────────────────────────────
+        a1, a2, a3, a4, a5, a6 = st.columns(6)
+        a1.metric("AMR-enabled meters", total_amr)
+        a2.metric("🟢 Last 24h",   len(green),  f"{round(len(green)/total_amr*100) if total_amr else 0}%")
+        a3.metric("🟡 1–3 days",   len(yellow), f"{round(len(yellow)/total_amr*100) if total_amr else 0}%")
+        a4.metric("🟠 4–7 days",   len(orange), f"{round(len(orange)/total_amr*100) if total_amr else 0}%")
+        a5.metric("🔴 7+ days",    len(red),    f"{round(len(red)/total_amr*100) if total_amr else 0}%")
+        a6.metric("⚫ No reading", len(never),  f"{round(len(never)/total_amr*100) if total_amr else 0}%")
+
+        # Low battery alert
+        low_bat_meters = amr_table[amr_table["low_battery"] == 1]
+        if not low_bat_meters.empty:
+            st.warning(
+                f"🔋 **{len(low_bat_meters)} meters reporting low battery** — "
+                f"{', '.join(low_bat_meters['stand'].head(8).tolist())}"
+                + (" and more…" if len(low_bat_meters) > 8 else "")
+            )
+
+        st.divider()
+
+        # ── Filters ───────────────────────────────────────────────────
+        af1, af2, af3, af4 = st.columns(4)
+        with af1:
+            a_type = st.multiselect("Meter type", ["Water", "Electrical"],
+                                    default=["Water", "Electrical"], key="amr_type")
+        with af2:
+            a_status = st.multiselect(
+                "Status", ["🟢 Last 24h", "🟡 1–3 days", "🟠 4–7 days", "🔴 7+ days", "⚫ No reading"],
+                default=["🟢 Last 24h", "🟡 1–3 days", "🟠 4–7 days", "🔴 7+ days", "⚫ No reading"],
+                key="amr_status_filter"
+            )
+        with af3:
+            a_section = st.multiselect("Section (WBHO)",
+                                       sorted(amr_table["wbho_section"].dropna().unique()),
+                                       key="amr_section")
+        with af4:
+            a_serial_search = st.text_input("Search serial", key="amr_serial_search")
+
+        status_badge_map = {
+            "🟢 Last 24h":   "amr-green",
+            "🟡 1–3 days":   "amr-yellow",
+            "🟠 4–7 days":   "amr-orange",
+            "🔴 7+ days":    "amr-red",
+            "⚫ No reading": "amr-never",
+        }
+        selected_badges = [status_badge_map[s] for s in a_status]
+
+        view = amr_table[
+            amr_table["meter_type"].isin(a_type) &
+            amr_table["status_badge"].isin(selected_badges)
+        ]
+        if a_section:
+            view = view[view["wbho_section"].isin(a_section)]
+        if a_serial_search:
+            view = view[view["serial"].str.contains(a_serial_search.strip(), case=False, na=False)]
+
+        # ── Visual status grid (HTML component) ───────────────────────
+        st.markdown("##### Status overview")
+
+        color_map = {
+            "amr-green":  "#2E7D52",
+            "amr-yellow": "#D4AC0D",
+            "amr-orange": "#E67E22",
+            "amr-red":    "#BD4B2C",
+            "amr-never":  "#607080",
+        }
+
+        grid_html = "<div style='display:flex;flex-wrap:wrap;gap:5px;padding:8px 0'>"
+        for _, r in amr_table.sort_values(["meter_type","stand"]).iterrows():
+            c = color_map.get(r["status_badge"], "#607080")
+            in_filter = (
+                r["meter_type"] in a_type and
+                r["status_badge"] in selected_badges and
+                (not a_section or r["wbho_section"] in a_section)
+            )
+            opacity = "1.0" if in_filter else "0.18"
+            low_bat_ring = "outline:2px dashed #FFF176;" if r["low_battery"] else ""
+            stand_s  = r["stand"]
+            mtype_s  = r["meter_type"]
+            status_s = r["status_label"]
+            grid_html += (
+                f"<span title='Stand {stand_s} · {mtype_s} · {status_s}' "
+                f"style='display:inline-block;width:36px;height:24px;border-radius:4px;"
+                f"background:{c};opacity:{opacity};{low_bat_ring}"
+                f"font-size:8px;color:#fff;font-weight:700;text-align:center;"
+                f"line-height:24px;cursor:default'>{stand_s}</span>"
+            )
+        grid_html += "</div>"
+        grid_html += (
+            "<div style='display:flex;gap:16px;font-size:11px;margin-top:6px;flex-wrap:wrap'>"
+            "<span>🟢 Last 24h</span><span>🟡 1–3 days</span>"
+            "<span>🟠 4–7 days</span><span>🔴 7+ days</span><span>⚫ No reading</span>"
+            "<span style='color:#FFF176'>✦ dashed border = low battery</span>"
+            "</div>"
+        )
+        st.markdown(grid_html, unsafe_allow_html=True)
+
+        st.divider()
+
+        # ── Detail table ──────────────────────────────────────────────
+        st.markdown(f"##### Meter detail ({len(view)} meters)")
+
+        def fmt_reading(v, mtype):
+            if v is None:
+                return "—"
+            if mtype == "Water":
+                return f"{v:,.1f} L"
+            return f"{v:,.3f} kWh"
+
+        display_rows = []
+        for _, r in view.sort_values(["status_badge", "stand"]).iterrows():
+            display_rows.append({
+                "Stand":        r["stand"],
+                "Type":         r["meter_type"],
+                "Unit type":    r["unit_type"],
+                "Section":      r["wbho_section"],
+                "Serial":       r["serial"],
+                "Last reading": r["last_reading"][:16].replace("T", " ") if r["last_reading"] else "—",
+                "Reading":      fmt_reading(r["reading_value"], r["meter_type"]),
+                "Status":       r["status_label"],
+                "Low battery":  "🔋" if r["low_battery"] else "",
+            })
+
+        disp_df = pd.DataFrame(display_rows)
+        st.dataframe(disp_df, use_container_width=True, hide_index=True,
+                     column_config={
+                         "Status": st.column_config.TextColumn("Status", width="small"),
+                         "Low battery": st.column_config.TextColumn("Bat", width="small"),
+                     })
+
+        import hashlib
+        csv_out = disp_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download AMR status as CSV", csv_out,
+            file_name="amr_status.csv", mime="text/csv",
+            key=f"dl_amr_{hashlib.md5(csv_out).hexdigest()[:8]}"
+        )
+
+        st.divider()
+
+        # ── Per-type breakdown ────────────────────────────────────────
+        st.markdown("##### Breakdown by meter type")
+        for mtype in ["Water", "Electrical"]:
+            subset = amr_table[amr_table["meter_type"] == mtype]
+            if subset.empty:
+                continue
+            counts = subset["status_badge"].value_counts()
+            total  = len(subset)
+            parts  = []
+            for badge, emoji, label in [
+                ("amr-green",  "🟢", "Last 24h"),
+                ("amr-yellow", "🟡", "1–3 days"),
+                ("amr-orange", "🟠", "4–7 days"),
+                ("amr-red",    "🔴", "7+ days"),
+                ("amr-never",  "⚫", "No reading"),
+            ]:
+                n = counts.get(badge, 0)
+                if n:
+                    parts.append(f"{emoji} **{n}** {label}")
+            low = len(subset[subset["low_battery"] == 1])
+            bat_str = f" · 🔋 **{low}** low battery" if low else ""
+            importing_pct = round(counts.get("amr-green", 0) / total * 100) if total else 0
+            st.markdown(
+                f"**{mtype}** ({total} meters · {importing_pct}% importing) &nbsp; "
+                + " &ensp; ".join(parts) + bat_str
+            )
+
+        st.caption(
+            f"Auto-refreshes every hour on the next page load (st.cache_data TTL=3600s). "
+            f"Click '🔄 Fetch latest from SFTP' to force an immediate refresh."
+        )
