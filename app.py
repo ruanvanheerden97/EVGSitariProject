@@ -2588,420 +2588,258 @@ with tab_amr:
     else:
         st.divider()
 
-        # ── Build enriched AMR table from df + readings ───────────────
-        amr_df = df[df["installed"] & df["serial"].str.len().gt(0)].copy()
-        amr_df = amr_df.drop_duplicates(subset=["stand", "meter_type"])
+        # ── Split: AMR installed vs not installed ─────────────────────
+        # Only meters where amr=True are expected to import.
+        # Meters with amr=False have no AMR device fitted yet.
+        all_installed = df[df["installed"] & df["serial"].str.len().gt(0)].copy()
+        all_installed = all_installed.drop_duplicates(subset=["stand", "meter_type"])
+        amr_installed_df = all_installed[all_installed["amr"] == True]
+        amr_pending_df   = all_installed[all_installed["amr"] == False]
 
         rows = []
-        for _, r in amr_df.iterrows():
-            serial = r["serial"]
+        for _, r in amr_installed_df.iterrows():
+            serial  = r["serial"]
             reading = amr_readings.get(serial)
-            rd_iso   = reading["reading_date"]   if reading else None
-            rd_value = reading["reading_value"]  if reading else None
-            low_bat  = int(reading["low_battery"]) if reading else 0
+            rd_iso  = reading["reading_date"]  if reading else None
+            rd_val  = reading["reading_value"] if reading else None
+            low_bat = int(reading["low_battery"]) if reading else 0
             label, color, badge = amr_status_info(rd_iso)
-            rows.append({
-                "stand":        r["stand"],
-                "meter_type":   r["meter_type"],
-                "unit_type":    r["unit_type"],
-                "wbho_section": r["wbho_section"],
-                "serial":       serial,
-                "amr_ok":       r["amr"],
-                "last_reading": rd_iso,
-                "reading_value":rd_value,
-                "low_battery":  low_bat,
-                "status_label": label,
-                "status_color": color,
-                "status_badge": badge,
-            })
+            rows.append({"stand":r["stand"],"meter_type":r["meter_type"],"unit_type":r["unit_type"],
+                         "wbho_section":r["wbho_section"],"serial":serial,"last_reading":rd_iso,
+                         "reading_value":rd_val,"low_battery":low_bat,
+                         "status_label":label,"status_color":color,"status_badge":badge})
 
-        amr_table = pd.DataFrame(rows)
+        amr_table = pd.DataFrame(rows) if rows else pd.DataFrame(
+            columns=["stand","meter_type","unit_type","wbho_section","serial",
+                     "last_reading","reading_value","low_battery","status_label","status_color","status_badge"])
 
-        # Status buckets
-        green  = amr_table[amr_table["status_badge"] == "amr-green"]
-        yellow = amr_table[amr_table["status_badge"] == "amr-yellow"]
-        orange = amr_table[amr_table["status_badge"] == "amr-orange"]
-        red    = amr_table[amr_table["status_badge"] == "amr-red"]
-        never  = amr_table[amr_table["status_badge"] == "amr-never"]
-        total_amr = len(amr_table)
+        green  = amr_table[amr_table["status_badge"]=="amr-green"]
+        yellow = amr_table[amr_table["status_badge"]=="amr-yellow"]
+        orange = amr_table[amr_table["status_badge"]=="amr-orange"]
+        red    = amr_table[amr_table["status_badge"]=="amr-red"]
+        never  = amr_table[amr_table["status_badge"]=="amr-never"]
+        total_amr_inst = len(amr_table)
+        importing_pct  = round(len(green)/total_amr_inst*100) if total_amr_inst else 0
 
-        # ── KPIs ──────────────────────────────────────────────────────
-        a1, a2, a3, a4, a5, a6 = st.columns(6)
-        a1.metric("AMR-enabled meters", total_amr)
-        a2.metric("🟢 Last 24h",   len(green),  f"{round(len(green)/total_amr*100) if total_amr else 0}%")
-        a3.metric("🟡 1–3 days",   len(yellow), f"{round(len(yellow)/total_amr*100) if total_amr else 0}%")
-        a4.metric("🟠 4–7 days",   len(orange), f"{round(len(orange)/total_amr*100) if total_amr else 0}%")
-        a5.metric("🔴 7+ days",    len(red),    f"{round(len(red)/total_amr*100) if total_amr else 0}%")
-        a6.metric("⚫ No reading", len(never),  f"{round(len(never)/total_amr*100) if total_amr else 0}%")
-
-        # Low battery alert
-        low_bat_meters = amr_table[amr_table["low_battery"] == 1]
-        if not low_bat_meters.empty:
-            st.warning(
-                f"🔋 **{len(low_bat_meters)} meters reporting low battery** — "
-                f"{', '.join(low_bat_meters['stand'].head(8).tolist())}"
-                + (" and more…" if len(low_bat_meters) > 8 else "")
-            )
-
-        st.divider()
-
-        # ── Filters ───────────────────────────────────────────────────
-        af1, af2, af3, af4 = st.columns(4)
-        with af1:
-            a_type = st.multiselect("Meter type", ["Water", "Electrical"],
-                                    default=["Water", "Electrical"], key="amr_type")
-        with af2:
-            a_status = st.multiselect(
-                "Status", ["🟢 Last 24h", "🟡 1–3 days", "🟠 4–7 days", "🔴 7+ days", "⚫ No reading"],
-                default=["🟢 Last 24h", "🟡 1–3 days", "🟠 4–7 days", "🔴 7+ days", "⚫ No reading"],
-                key="amr_status_filter"
-            )
-        with af3:
-            a_section = st.multiselect("Section (WBHO)",
-                                       sorted(amr_table["wbho_section"].dropna().unique()),
-                                       key="amr_section")
-        with af4:
-            a_serial_search = st.text_input("Search serial", key="amr_serial_search")
-
-        status_badge_map = {
-            "🟢 Last 24h":   "amr-green",
-            "🟡 1–3 days":   "amr-yellow",
-            "🟠 4–7 days":   "amr-orange",
-            "🔴 7+ days":    "amr-red",
-            "⚫ No reading": "amr-never",
-        }
-        selected_badges = [status_badge_map[s] for s in a_status]
-
-        view = amr_table[
-            amr_table["meter_type"].isin(a_type) &
-            amr_table["status_badge"].isin(selected_badges)
-        ]
-        if a_section:
-            view = view[view["wbho_section"].isin(a_section)]
-        if a_serial_search:
-            view = view[view["serial"].str.contains(a_serial_search.strip(), case=False, na=False)]
-
-        # ── Visual status grid (HTML component) ───────────────────────
-        # ── Faulty cross-reference ────────────────────────────────────
-        faulty_pending_df = df[df["faulty"] & ~df["faulty_replaced"]] if "faulty" in df.columns else pd.DataFrame()
+        faulty_pending_df    = df[df["faulty"] & ~df["faulty_replaced"]] if "faulty" in df.columns else pd.DataFrame()
         faulty_pending_stands = set(faulty_pending_df["stand"].tolist())
 
-        # Flag stale/missing meters that are also in the faulty list
-        stale_and_faulty = amr_table[
-            amr_table["status_badge"].isin(["amr-orange","amr-red","amr-never"]) &
-            amr_table["stand"].isin(faulty_pending_stands)
-        ]
-        if not stale_and_faulty.empty:
-            st.warning(
-                f"⚠️ **{len(stale_and_faulty)} stale/missing meters are also flagged as faulty (not yet replaced)** — "
-                f"likely cause of missing readings: "
-                + ", ".join(f"Stand {r['stand']}" for _, r in stale_and_faulty.iterrows())
-            )
+        # ── KPI row ───────────────────────────────────────────────────
+        st.markdown("#### AMR commissioned meters — import status")
+        k1,k2,k3,k4,k5,k6,k7 = st.columns(7)
+        k1.metric("AMR commissioned",    total_amr_inst)
+        k2.metric("🟢 <24h",  len(green),  f"{importing_pct}%")
+        k3.metric("🟡 1–3d",  len(yellow), f"{round(len(yellow)/total_amr_inst*100) if total_amr_inst else 0}%")
+        k4.metric("🟠 4–7d",  len(orange), f"{round(len(orange)/total_amr_inst*100) if total_amr_inst else 0}%")
+        k5.metric("🔴 7d+",   len(red),    f"{round(len(red)/total_amr_inst*100) if total_amr_inst else 0}%")
+        k6.metric("⚫ Never",  len(never),  f"{round(len(never)/total_amr_inst*100) if total_amr_inst else 0}%")
+        k7.metric("🔧 AMR pending", len(amr_pending_df), "meter in, AMR not fitted")
+
+        low_bat_meters   = amr_table[amr_table["low_battery"]==1]
+        stale_and_faulty = amr_table[amr_table["status_badge"].isin(["amr-orange","amr-red","amr-never"]) &
+                                     amr_table["stand"].isin(faulty_pending_stands)]
+        ac1, ac2 = st.columns(2)
+        with ac1:
+            if not low_bat_meters.empty:
+                st.warning(f"🔋 **{len(low_bat_meters)} low battery** — " +
+                           ", ".join(low_bat_meters["stand"].head(6).tolist()) +
+                           (" …" if len(low_bat_meters)>6 else ""))
+        with ac2:
+            if not stale_and_faulty.empty:
+                st.warning(f"⚠️ **{len(stale_and_faulty)} stale + faulty** — " +
+                           ", ".join(f"Stand {r['stand']}" for _,r in stale_and_faulty.head(5).iterrows()) +
+                           (" …" if len(stale_and_faulty)>5 else ""))
 
         st.divider()
 
-        # ── Site map coloured by AMR status ───────────────────────────
-        st.markdown("##### AMR status — site map")
+        # ── Two-column layout: filters+table | map ────────────────────
+        left_col, right_col = st.columns([1, 1.6])
 
-        # Rebuild kiosk/minisub/polygon lookup (reuse KML already loaded if available)
-        _kml_path = find_kml_file()
-        _amr_polygons, _amr_kiosks = [], []
-        if _kml_path:
-            try:
-                with open(_kml_path, "rb") as _f:
-                    _kml_data = _f.read()
-                _amr_polygons, _amr_kiosks, _ = parse_kml(_kml_data)
-            except Exception:
-                pass
+        with left_col:
+            st.markdown("##### Filters & detail")
+            af1, af2 = st.columns(2)
+            with af1:
+                a_type = st.multiselect("Type",["Water","Electrical"],
+                                        default=["Water","Electrical"],key="amr_type")
+            with af2:
+                a_status = st.multiselect("Status",
+                    ["🟢 Last 24h","🟡 1–3 days","🟠 4–7 days","🔴 7+ days","⚫ No reading"],
+                    default=["🟢 Last 24h","🟡 1–3 days","🟠 4–7 days","🔴 7+ days","⚫ No reading"],
+                    key="amr_status_filter")
+            a_section = st.multiselect("Section",sorted(amr_table["wbho_section"].dropna().unique()),key="amr_section")
+            a_serial_search = st.text_input("Search serial",key="amr_serial_search")
 
-        if not _amr_polygons:
-            st.info("No KML found — push your `EVG_Sitari.kml` to the repo to see the site map here. Showing summary grid instead.")
-            # Fallback chip grid
-            color_map_fb = {"amr-green":"#2E7D52","amr-yellow":"#D4AC0D","amr-orange":"#E67E22","amr-red":"#BD4B2C","amr-never":"#607080"}
-            fg = "<div style='display:flex;flex-wrap:wrap;gap:5px;padding:8px 0'>"
-            for _, r in amr_table.sort_values(["meter_type","stand"]).iterrows():
-                c = color_map_fb.get(r["status_badge"],"#607080")
-                in_f = r["meter_type"] in a_type and r["status_badge"] in selected_badges
-                op = "1.0" if in_f else "0.15"
-                stand_fb = r["stand"]
-                status_fb = r["status_label"]
-                fg += (f"<span title='Stand {stand_fb} · {status_fb}' "
-                       f"style='display:inline-block;width:36px;height:24px;border-radius:4px;"
-                       f"background:{c};opacity:{op};font-size:8px;color:#fff;font-weight:700;"
-                       f"text-align:center;line-height:24px'>{stand_fb}</span>")
-            fg += "</div>"
-            st.markdown(fg, unsafe_allow_html=True)
-        else:
-            _amr_map_df = df.copy()
-            if a_type and len(a_type) < 2:
-                _amr_map_df = df[df["meter_type"].isin(a_type)]
+            status_badge_map = {"🟢 Last 24h":"amr-green","🟡 1–3 days":"amr-yellow",
+                                "🟠 4–7 days":"amr-orange","🔴 7+ days":"amr-red","⚫ No reading":"amr-never"}
+            selected_badges = [status_badge_map[s] for s in a_status]
 
-            _center = kml_center(_amr_polygons, _amr_kiosks, [])
-            _gh  = _poly_hash(_amr_polygons, _amr_kiosks)
-            _dh  = _df_hash(_amr_map_df)
-            _ah  = _amr_hash(amr_readings)
-            _fph = str(sorted(faulty_pending_df["stand"].tolist())) if not faulty_pending_df.empty else ""
+            view = amr_table[amr_table["meter_type"].isin(a_type) &
+                             amr_table["status_badge"].isin(selected_badges)]
+            if a_section:
+                view = view[view["wbho_section"].isin(a_section)]
+            if a_serial_search:
+                view = view[view["serial"].str.contains(a_serial_search.strip(),case=False,na=False)]
 
-            with st.spinner("Building AMR map…"):
-                amr_map_html = cached_amr_map_html(
-                    _gh, _dh, _ah, _fph, _center,
-                    _amr_polygons, _amr_kiosks, _amr_map_df, amr_readings, faulty_pending_df
-                )
-                render_cached_map(amr_map_html, height=620)
+            def fmt_reading(v, mtype):
+                if v is None: return "—"
+                return f"{v:,.1f} L" if mtype=="Water" else f"{v:,.3f} kWh"
 
-            # Stand selection via dropdown only (no st_folium click overhead)
-            auto_stand = None
+            display_rows = []
+            for _, r in view.sort_values(["status_badge","stand"]).iterrows():
+                display_rows.append({
+                    "Stand":r["stand"],"Type":r["meter_type"],"Section":r["wbho_section"],
+                    "Serial":r["serial"],
+                    "Last read":str(r["last_reading"])[:16].replace("T"," ") if r["last_reading"] and str(r["last_reading"]) not in ("nan","None","") else "—",
+                    "Reading":fmt_reading(r["reading_value"],r["meter_type"]),
+                    "Status":r["status_label"],
+                    "Fault":"\u26a0\ufe0f" if r["stand"] in faulty_pending_stands else "",
+                    "Bat":"\U0001f50b" if r["low_battery"] else "",
+                })
+            disp_df = pd.DataFrame(display_rows)
+            st.caption(f"{len(view)} meters matching filters")
+            st.dataframe(disp_df,use_container_width=True,hide_index=True,height=300)
 
-            # AMR map legend
-            leg_items = [
-                ("#2E7D52","🟢 Last 24h"),("#D4AC0D","🟡 1–3 days"),
-                ("#E67E22","🟠 4–7 days"),("#BD4B2C","🔴 7+ days"),
-                ("#607080","⚫ No reading"),("#EF4444","⚠️ Faulty pending"),
-            ]
-            leg = "<div style='display:flex;flex-wrap:wrap;gap:12px;font-size:11px;margin-top:4px'>"
-            for col, lbl in leg_items:
-                leg += f"<span><span style='display:inline-block;width:12px;height:12px;border-radius:3px;background:{col};vertical-align:middle;margin-right:4px'></span>{lbl}</span>"
-            leg += "</div>"
-            st.markdown(leg, unsafe_allow_html=True)
+            if not amr_pending_df.empty:
+                with st.expander(f"🔧 AMR not yet fitted ({len(amr_pending_df)})"):
+                    st.dataframe(amr_pending_df[["stand","meter_type","unit_type","wbho_section","serial"]].rename(
+                        columns={"stand":"Stand","meter_type":"Type","unit_type":"Unit","wbho_section":"Section","serial":"Serial"}),
+                        use_container_width=True,hide_index=True)
 
-            if auto_stand:
-                st.session_state["amr_selected_stand"] = auto_stand
+            import hashlib
+            csv_out = disp_df.to_csv(index=False).encode("utf-8")
+            st.download_button("\u2b07\ufe0f Download table",csv_out,file_name="amr_status.csv",
+                               mime="text/csv",key=f"dl_amr_{hashlib.md5(csv_out).hexdigest()[:8]}")
+
+            st.markdown("**Import rate by type**")
+            for mtype in ["Water","Electrical"]:
+                sub = amr_table[amr_table["meter_type"]==mtype]
+                if sub.empty: continue
+                cnt = sub["status_badge"].value_counts()
+                tot = len(sub)
+                pct = round(cnt.get("amr-green",0)/tot*100) if tot else 0
+                low = len(sub[sub["low_battery"]==1])
+                parts = [f"{e} {cnt.get(b,0)}" for b,e in [("amr-green","\U0001f7e2"),("amr-yellow","\U0001f7e1"),
+                         ("amr-orange","\U0001f7e0"),("amr-red","\U0001f534"),("amr-never","\u26ab")] if cnt.get(b,0)]
+                st.caption(f"**{mtype}** {tot} · {pct}% importing · " + " ".join(parts) +
+                           (f" · \U0001f50b {low}" if low else ""))
+
+        with right_col:
+            st.markdown("##### AMR site map")
+            _kml_path = find_kml_file()
+            _amr_polygons,_amr_kiosks = [],[]
+            if _kml_path:
+                try:
+                    with open(_kml_path,"rb") as _f: _kml_data = _f.read()
+                    _amr_polygons,_amr_kiosks,_ = parse_kml(_kml_data)
+                except Exception: pass
+
+            if not _amr_polygons:
+                st.info("No KML found — push `EVG_Sitari.kml` to see the map.")
+            else:
+                _amr_map_df = df.copy() if len(a_type)==2 else df[df["meter_type"].isin(a_type)]
+                _center = kml_center(_amr_polygons,_amr_kiosks,[])
+                _gh = _poly_hash(_amr_polygons,_amr_kiosks)
+                _dh = _df_hash(_amr_map_df)
+                _ah = _amr_hash(amr_readings)
+                _fph = str(sorted(faulty_pending_df["stand"].tolist())) if not faulty_pending_df.empty else ""
+                with st.spinner("Building map…"):
+                    amr_map_html = cached_amr_map_html(_gh,_dh,_ah,_fph,_center,
+                        _amr_polygons,_amr_kiosks,_amr_map_df,amr_readings,faulty_pending_df)
+                    render_cached_map(amr_map_html, height=500)
+                leg = "<div style='display:flex;flex-wrap:wrap;gap:10px;font-size:11px;margin-top:4px'>"
+                for col,lbl in [("#2E7D52","🟢 <24h"),("#D4AC0D","🟡 1–3d"),("#E67E22","🟠 4–7d"),
+                                 ("#BD4B2C","🔴 7d+"),("#607080","⚫ Never"),("#EF4444","⚠️ Faulty")]:
+                    leg += (f"<span><span style='display:inline-block;width:11px;height:11px;border-radius:2px;"
+                            f"background:{col};vertical-align:middle;margin-right:3px'></span>{lbl}</span>")
+                leg += "</div>"
+                st.markdown(leg,unsafe_allow_html=True)
 
         st.divider()
 
-        # ── Stand history ──────────────────────────────────────────────
-        st.markdown("##### Stand history")
-
-        # Build stand options (only installed meters with a serial)
+        # ── Stand history (full width) ─────────────────────────────────
+        st.markdown("##### Stand reading history")
         stand_options = sorted(amr_table["stand"].unique().tolist())
         default_stand = st.session_state.get("amr_selected_stand", stand_options[0] if stand_options else None)
-        if default_stand not in stand_options:
-            default_stand = stand_options[0] if stand_options else None
+        if default_stand not in stand_options and stand_options:
+            default_stand = stand_options[0]
 
-        sel_col, info_col = st.columns([1, 2])
-        with sel_col:
-            selected_stand = st.selectbox(
-                "Select a stand to view its reading history",
-                options=stand_options,
+        h_left, h_right = st.columns([1,3])
+        with h_left:
+            selected_stand = st.selectbox("Select stand",options=stand_options,
                 index=stand_options.index(default_stand) if default_stand in stand_options else 0,
-                key="amr_stand_select"
-            )
+                key="amr_stand_select")
             if selected_stand:
                 st.session_state["amr_selected_stand"] = selected_stand
-
-        if selected_stand:
-            stand_rows  = amr_table[amr_table["stand"] == selected_stand]
-            serials     = stand_rows["serial"].dropna().unique().tolist()
-            serials     = [s for s in serials if s and s not in ("nan","None","")]
-
-            with info_col:
-                if not stand_rows.empty:
-                    r0 = stand_rows.iloc[0]
-                    _, color_h, badge_h = amr_status_info(r0["last_reading"])
+                stand_row = amr_table[amr_table["stand"]==selected_stand]
+                if not stand_row.empty:
+                    r0 = stand_row.iloc[0]
+                    _,color_h,_ = amr_status_info(r0["last_reading"])
                     st.markdown(
-                        f"**Stand {selected_stand}** · {r0['unit_type']} · {r0['wbho_section']}  \n"
-                        f"Serial: `{r0['serial']}` · "
-                        f"<span style='background:{color_h}22;color:{color_h};padding:1px 7px;"
-                        f"border-radius:8px;font-size:12px;font-weight:600'>{r0['status_label']}</span>"
-                        + (" &nbsp; ⚠️ **Faulty**" if selected_stand in faulty_pending_stands else ""),
-                        unsafe_allow_html=True
-                    )
+                        f"**{r0['unit_type']}** · {r0['wbho_section']}  \nSerial: `{r0['serial']}`  \n"
+                        f"<span style='background:{color_h}22;color:{color_h};padding:1px 8px;border-radius:8px;"
+                        f"font-size:12px;font-weight:600'>{r0['status_label']}</span>"
+                        + (" &nbsp;⚠️ **Faulty**" if selected_stand in faulty_pending_stands else ""),
+                        unsafe_allow_html=True)
 
-            if not serials:
-                st.info(f"Stand {selected_stand} has no meter serial recorded — can't look up history.")
-            else:
-                import plotly.graph_objects as go
-                import plotly.express as px
-
-                # DB stats
-                total_rows, distinct_serials, min_dt, max_dt = db_stats()
-                st.caption(
-                    f"History database: **{total_rows:,}** readings · **{distinct_serials}** serials · "
-                    f"from {min_dt[:10] if min_dt else '—'} to {max_dt[:10] if max_dt else '—'}"
-                )
-
-                all_hist = []
-                for serial in serials:
-                    hist_df = db_get_history(serial)
-                    if not hist_df.empty:
-                        hist_df["serial"] = serial
-                        hist_df["meter_type"] = stand_rows[stand_rows["serial"] == serial]["meter_type"].iloc[0] if len(stand_rows[stand_rows["serial"] == serial]) else "Unknown"
-                        all_hist.append(hist_df)
-
-                if not all_hist:
-                    st.info(f"No historical readings in the database yet for stand {selected_stand}. History builds up as readings are fetched from SFTP.")
+        with h_right:
+            if selected_stand:
+                serials = amr_table[amr_table["stand"]==selected_stand]["serial"].dropna().unique().tolist()
+                serials = [s for s in serials if s and s not in ("nan","None","")]
+                if not serials:
+                    st.info("No serial recorded for this stand.")
                 else:
-                    hist_full = pd.concat(all_hist, ignore_index=True).sort_values("reading_date")
-
-                    for hist_sub in all_hist:
-                        mtype   = hist_sub["meter_type"].iloc[0]
-                        serial  = hist_sub["serial"].iloc[0]
-                        unit    = "Litres" if mtype == "Water" else "kWh"
-                        n_reads = len(hist_sub)
-                        n_low   = int(hist_sub["low_battery"].sum())
-
-                        # Calculate consumption (delta between readings)
-                        # Pre-compute derived columns before the tab split
-                        # so both tabs can access them
-                        hist_sub = hist_sub.copy()
-                        hist_sub["consumption"] = hist_sub["reading_value"].diff().clip(lower=0)
-                        hist_sub["gap_hours"]   = hist_sub["reading_date"].diff().dt.total_seconds() / 3600
-
-                        tab_chart, tab_raw = st.tabs([f"📈 {mtype} chart", f"📋 Raw readings ({n_reads})"])
-
+                    import plotly.graph_objects as go
+                    total_rows_db,_,mn,mx = db_stats()
+                    st.caption(f"History DB: **{total_rows_db:,}** readings · {mn[:10] if mn else '—'} → {mx[:10] if mx else '—'}")
+                    for serial in serials:
+                        hist_df = db_get_history(serial)
+                        mtype_rows = amr_table[(amr_table["stand"]==selected_stand)&(amr_table["serial"]==serial)]
+                        mtype = mtype_rows["meter_type"].iloc[0] if not mtype_rows.empty else "Unknown"
+                        unit  = "Litres" if mtype=="Water" else "kWh"
+                        if hist_df.empty:
+                            st.info(f"No history yet for {serial}. Builds up with each hourly fetch.")
+                            continue
+                        hist_df = hist_df.copy()
+                        hist_df["consumption"] = hist_df["reading_value"].diff().clip(lower=0)
+                        hist_df["gap_hours"]   = hist_df["reading_date"].diff().dt.total_seconds()/3600
+                        tab_chart, tab_raw = st.tabs([f"📈 {mtype} ({len(hist_df)} readings)","📋 Raw"])
                         with tab_chart:
-                            if len(hist_sub) < 2:
-                                st.info("Need at least 2 readings to draw a chart. Keep fetching data hourly.")
-                            else:
-                                fig = go.Figure()
-                                # Cumulative meter reading
-                                fig.add_trace(go.Scatter(
-                                    x=hist_sub["reading_date"],
-                                    y=hist_sub["reading_value"],
-                                    mode="lines+markers",
-                                    name=f"Meter reading ({unit})",
-                                    line=dict(color="#2E7D52" if mtype == "Water" else "#5B86B3", width=2),
-                                    marker=dict(size=4),
-                                ))
-                                # Consumption bars
-                                fig.add_trace(go.Bar(
-                                    x=hist_sub["reading_date"],
-                                    y=hist_sub["consumption"],
-                                    name=f"Consumption per interval ({unit})",
-                                    marker_color="#E69138",
-                                    opacity=0.5,
-                                    yaxis="y2",
-                                ))
-                                # Mark gaps (missed readings) — points where gap > 3 hours
-                                gaps = hist_sub[hist_sub["gap_hours"] > 3]
-                                if not gaps.empty:
-                                    fig.add_trace(go.Scatter(
-                                        x=gaps["reading_date"],
-                                        y=gaps["reading_value"],
-                                        mode="markers",
-                                        name="Gap in readings",
-                                        marker=dict(color="#BD4B2C", size=10, symbol="x"),
-                                    ))
-                                # Low battery markers
-                                lbat = hist_sub[hist_sub["low_battery"] == 1]
-                                if not lbat.empty:
-                                    fig.add_trace(go.Scatter(
-                                        x=lbat["reading_date"],
-                                        y=lbat["reading_value"],
-                                        mode="markers",
-                                        name="Low battery",
-                                        marker=dict(color="#FFF176", size=8, symbol="triangle-down"),
-                                    ))
-
-                                fig.update_layout(
-                                    title=f"Stand {selected_stand} · {mtype} · Serial {serial}",
-                                    xaxis_title="Date / Time",
-                                    yaxis_title=f"Cumulative reading ({unit})",
-                                    yaxis2=dict(title=f"Consumption ({unit})", overlaying="y", side="right", showgrid=False),
-                                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                                    plot_bgcolor="#0E1117", paper_bgcolor="#0E1117",
-                                    font=dict(color="#E0E0E0"),
-                                    xaxis=dict(gridcolor="#1E2D3D"),
-                                    yaxis=dict(gridcolor="#1E2D3D"),
-                                    height=420,
-                                )
-                                st.plotly_chart(fig, use_container_width=True)
-                                st.caption(
-                                    f"🔴 X markers = gap >3h between readings · "
-                                    f"🟡 ▽ = low battery reported · "
-                                    f"Orange bars = consumption per interval"
-                                )
-
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(x=hist_df["reading_date"],y=hist_df["reading_value"],
+                                mode="lines+markers",name=f"Reading ({unit})",
+                                line=dict(color="#2E7D52" if mtype=="Water" else "#5B86B3",width=2),
+                                marker=dict(size=4)))
+                            fig.add_trace(go.Bar(x=hist_df["reading_date"],y=hist_df["consumption"],
+                                name="Usage/interval",marker_color="#E69138",opacity=0.5,yaxis="y2"))
+                            gaps = hist_df[hist_df["gap_hours"]>3]
+                            if not gaps.empty:
+                                fig.add_trace(go.Scatter(x=gaps["reading_date"],y=gaps["reading_value"],
+                                    mode="markers",name="Gap >3h",marker=dict(color="#BD4B2C",size=10,symbol="x")))
+                            lbat = hist_df[hist_df["low_battery"]==1]
+                            if not lbat.empty:
+                                fig.add_trace(go.Scatter(x=lbat["reading_date"],y=lbat["reading_value"],
+                                    mode="markers",name="Low bat",marker=dict(color="#FFF176",size=8,symbol="triangle-down")))
+                            fig.update_layout(
+                                title=f"Stand {selected_stand} · {mtype} · {serial}",
+                                xaxis_title=None,yaxis_title=unit,
+                                yaxis2=dict(title=f"Usage ({unit})",overlaying="y",side="right",showgrid=False),
+                                legend=dict(orientation="h",yanchor="bottom",y=1.02),
+                                plot_bgcolor="#0E1117",paper_bgcolor="#0E1117",
+                                font=dict(color="#E0E0E0"),xaxis=dict(gridcolor="#1E2D3D"),
+                                yaxis=dict(gridcolor="#1E2D3D"),height=340,margin=dict(t=60,b=20))
+                            st.plotly_chart(fig,use_container_width=True)
                         with tab_raw:
-                            raw_disp = hist_sub[["reading_date","reading_value","low_battery","gap_hours"]].copy()
-                            raw_disp.columns = ["Date / Time", f"Reading ({unit})", "Low battery", "Gap since prev (h)"]
-                            raw_disp["Date / Time"] = raw_disp["Date / Time"].dt.strftime("%d %b %Y %H:%M")
-                            raw_disp["Low battery"] = raw_disp["Low battery"].map({1:"🔋", 0:""})
-                            raw_disp["Gap since prev (h)"] = raw_disp["Gap since prev (h)"].fillna(0).round(1)
-                            st.dataframe(raw_disp.sort_values("Date / Time", ascending=False),
-                                         use_container_width=True, hide_index=True)
+                            raw_disp = hist_df[["reading_date","reading_value","low_battery","gap_hours"]].copy()
+                            raw_disp.columns = ["Date/Time",f"Reading ({unit})","Low bat","Gap (h)"]
+                            raw_disp["Date/Time"] = raw_disp["Date/Time"].dt.strftime("%d %b %Y %H:%M")
+                            raw_disp["Low bat"]   = raw_disp["Low bat"].map({1:"\U0001f50b",0:""})
+                            raw_disp["Gap (h)"]   = raw_disp["Gap (h)"].fillna(0).round(1)
+                            st.dataframe(raw_disp.sort_values("Date/Time",ascending=False),
+                                         use_container_width=True,hide_index=True,height=260)
                             import hashlib
                             rc = raw_disp.to_csv(index=False).encode("utf-8")
-                            st.download_button(f"Download {mtype} history", rc,
-                                               file_name=f"stand_{selected_stand}_{mtype.lower()}_history.csv",
-                                               key=f"dl_hist_{selected_stand}_{mtype}_{hashlib.md5(rc).hexdigest()[:6]}")
+                            st.download_button(f"\u2b07\ufe0f {mtype} history",rc,
+                                file_name=f"stand_{selected_stand}_{mtype.lower()}_history.csv",
+                                key=f"dl_hist_{selected_stand}_{mtype}_{hashlib.md5(rc).hexdigest()[:6]}")
 
-        st.divider()
-
-        # ── Detail table ──────────────────────────────────────────────
-        st.markdown(f"##### Meter detail ({len(view)} meters)")
-
-        def fmt_reading(v, mtype):
-            if v is None:
-                return "—"
-            if mtype == "Water":
-                return f"{v:,.1f} L"
-            return f"{v:,.3f} kWh"
-
-        display_rows = []
-        for _, r in view.sort_values(["status_badge", "stand"]).iterrows():
-            display_rows.append({
-                "Stand":        r["stand"],
-                "Type":         r["meter_type"],
-                "Unit type":    r["unit_type"],
-                "Section":      r["wbho_section"],
-                "Serial":       r["serial"],
-                "Last reading": str(r["last_reading"])[:16].replace("T", " ") if r["last_reading"] and str(r["last_reading"]) not in ("nan", "None", "") else "—",
-                "Reading":      fmt_reading(r["reading_value"], r["meter_type"]),
-                "Status":       r["status_label"],
-                "Faulty":       "⚠️" if r["stand"] in faulty_pending_stands else "",
-                "Low battery":  "🔋" if r["low_battery"] else "",
-            })
-
-        disp_df = pd.DataFrame(display_rows)
-        st.dataframe(disp_df, use_container_width=True, hide_index=True,
-                     column_config={
-                         "Status": st.column_config.TextColumn("Status", width="small"),
-                         "Faulty": st.column_config.TextColumn("Fault", width="small"),
-                         "Low battery": st.column_config.TextColumn("Bat", width="small"),
-                     })
-
-        import hashlib
-        csv_out = disp_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download AMR status as CSV", csv_out,
-            file_name="amr_status.csv", mime="text/csv",
-            key=f"dl_amr_{hashlib.md5(csv_out).hexdigest()[:8]}"
-        )
-
-        st.divider()
-
-        # ── Per-type breakdown ────────────────────────────────────────
-        st.markdown("##### Breakdown by meter type")
-        for mtype in ["Water", "Electrical"]:
-            subset = amr_table[amr_table["meter_type"] == mtype]
-            if subset.empty:
-                continue
-            counts = subset["status_badge"].value_counts()
-            total  = len(subset)
-            parts  = []
-            for badge, emoji, label in [
-                ("amr-green",  "🟢", "Last 24h"),
-                ("amr-yellow", "🟡", "1–3 days"),
-                ("amr-orange", "🟠", "4–7 days"),
-                ("amr-red",    "🔴", "7+ days"),
-                ("amr-never",  "⚫", "No reading"),
-            ]:
-                n = counts.get(badge, 0)
-                if n:
-                    parts.append(f"{emoji} **{n}** {label}")
-            low = len(subset[subset["low_battery"] == 1])
-            bat_str = f" · 🔋 **{low}** low battery" if low else ""
-            faulty_stale = len(subset[subset["stand"].isin(faulty_pending_stands) & subset["status_badge"].isin(["amr-orange","amr-red","amr-never"])])
-            fault_str = f" · ⚠️ **{faulty_stale}** stale+faulty" if faulty_stale else ""
-            importing_pct = round(counts.get("amr-green", 0) / total * 100) if total else 0
-            st.markdown(
-                f"**{mtype}** ({total} meters · {importing_pct}% importing) &nbsp; "
-                + " &ensp; ".join(parts) + bat_str + fault_str
-            )
-
-        st.caption(
-            f"Auto-refreshes every hour on the next page load (st.cache_data TTL=3600s). "
-            f"Click '🔄 Fetch latest from SFTP' to force an immediate refresh. "
-            f"History database stores all readings and persists between sessions."
-        )
+        st.caption("Auto-refreshes hourly. History stored permanently in Supabase.")
