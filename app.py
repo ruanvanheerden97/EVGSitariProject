@@ -1010,8 +1010,11 @@ def build_amr_map(polygons, kiosks, df, amr_readings, faulty_df, center):
         rows  = df[df["stand"] == stand]
 
         # Find the best AMR status for this stand (prefer worst = most attention needed)
-        badge_priority = ["amr-red", "amr-orange", "amr-yellow", "amr-never", "amr-green"]
-        worst_badge    = "amr-never"
+        # Priority order: green (best/most recent) → yellow → orange → red → never (worst/no data)
+        # We track the BEST status across all meters on this stand so that
+        # any meter importing in the last 24h colours the stand green.
+        badge_priority = ["amr-green", "amr-yellow", "amr-orange", "amr-red", "amr-never"]
+        best_badge     = "amr-never"   # start at worst; upgrade toward green as we find readings
         last_reading_str = "—"
         last_value_str   = "—"
         last_serial      = "—"
@@ -1023,8 +1026,8 @@ def build_amr_map(polygons, kiosks, df, amr_readings, faulty_df, center):
             reading = amr_readings.get(serial)
             rd_iso  = reading["reading_date"] if reading else None
             _, _, badge = amr_status_info(rd_iso)
-            if badge_priority.index(badge) < badge_priority.index(worst_badge):
-                worst_badge = badge
+            if badge_priority.index(badge) < badge_priority.index(best_badge):
+                best_badge = badge
             if rd_iso and str(rd_iso) not in ("nan","None",""):
                 last_reading_str = str(rd_iso)[:16].replace("T"," ")
             if reading and reading.get("reading_value") is not None:
@@ -1033,7 +1036,7 @@ def build_amr_map(polygons, kiosks, df, amr_readings, faulty_df, center):
                 last_value_str = f"{val:,.1f} {'L' if mtype=='Water' else 'kWh'}"
             last_serial = serial
 
-        color   = amr_colors.get(worst_badge, "#607080")
+        color   = amr_colors.get(best_badge, "#607080")
         is_faulty_pending = stand in faulty_pending_stands
         border_color      = "#EF4444" if is_faulty_pending else color
         border_weight     = 3 if is_faulty_pending else 1.5
