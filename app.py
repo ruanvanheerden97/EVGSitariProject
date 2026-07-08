@@ -70,8 +70,10 @@ h1, h2, h3 {color: #152B45;}
 </style>
 """, unsafe_allow_html=True)
 
-WATER_SHEET_CANDIDATES = ["Water meters", "Water Meters"]
-ELEC_SHEET_CANDIDATES = ["Elec Meters", "Electrical Meters"]
+WATER_SHEET_CANDIDATES    = ["FS Water", "Water meters", "Water Meters"]
+ELEC_SHEET_CANDIDATES     = ["FS Elec", "Elec Meters", "Electrical Meters"]
+APRT_ELEC_CANDIDATES      = ["Aprt Elec", "Apartment Elec"]
+APRT_WATER_CANDIDATES     = ["Aprt Water", "Apartment Water"]
 FILE_PATTERN = "EVG_SIT_FS_Meter_Commissioning_*.xlsx"
 
 # ---------- Helpers ----------
@@ -507,8 +509,13 @@ def amr_status_info(reading_date_iso):
     return f"{days:.0f}d ago", "#BD4B2C", "amr-red"
 
 @st.cache_data(show_spinner=False)
-def load_data(file_path, _mtime):
+def load_data(file_path, _mtime, site_type="freestanding"):
+    """Load and normalise meter data. site_type: 'freestanding' or 'apartments'."""
     xls = pd.ExcelFile(file_path)
+
+    if site_type == "apartments":
+        return _load_apartment_data(xls)
+
     water_name = find_sheet(xls, WATER_SHEET_CANDIDATES)
     elec_name = find_sheet(xls, ELEC_SHEET_CANDIDATES)
 
@@ -589,8 +596,118 @@ def load_data(file_path, _mtime):
     return df
 
 
+def _load_apartment_data(xls):
+    """
+    Normalise Aprt Elec + Aprt Water sheets into the same schema as freestanding data.
+    Key differences:
+    - No commission date → installed = serial present
+    - No snag dates → no deadline tracking
+    - Apartment Water has two serials per stand (cold + hot)
+    - Hierarchy uses Apartment Block + Parent DB instead of WBHO Subsection + Kiosk
+    """
+    records = []
+    today = pd.Timestamp("today")
+
+    # ── Apartment Electrical ──────────────────────────────────────────
+    elec_name = find_sheet(xls, APRT_ELEC_CANDIDATES)
+    if elec_name:
+        edf = xls.parse(elec_name)
+        edf.columns = [str(c).strip() for c in edf.columns]
+        out = pd.DataFrame()
+        out["stand"]          = edf["Stand"].astype(str).str.strip()
+        out["unit_type"]      = edf.get("Apartment Block", pd.Series(["Apartment"]*len(edf))).astype(str).str.strip()
+        out["wbho_section"]   = edf.get("Parent DB",       pd.Series(["Unknown"  ]*len(edf))).astype(str).str.strip()
+        out["manufacturer"]   = ""
+        out["model"]          = ""
+        out["serial"]         = edf["Elect meter serial"].astype(str).str.strip().replace("nan","")
+        out["commission_date"]= pd.NaT
+        out["amr"]            = edf["AMR installed"].fillna(False).astype(bool)
+        out["deadline"]       = pd.NaT
+        out["faulty"]         = False
+        out["faulty_replaced"]= False
+        out["replacement_date"]= pd.NaT
+        out["meter_type"]     = "Electrical"
+        out["installed"]      = out["serial"].str.len().gt(0) & out["serial"].ne("nan")
+        out = out[out["stand"].notna() & (out["stand"] != "") & (out["stand"].str.lower() != "nan")]
+        records.append(out)
+
+    # ── Apartment Water (cold + hot — two rows per stand) ─────────────
+    water_name = find_sheet(xls, APRT_WATER_CANDIDATES)
+    if water_name:
+        wdf = xls.parse(water_name)
+        wdf.columns = [str(c).strip() for c in wdf.columns]
+        block_col = wdf.get("Apartment Block", pd.Series(["Apartment"]*len(wdf))).astype(str).str.strip()
+
+        for meter_subtype, serial_col in [("Water (Cold)", "Cold water Serial"),
+                                          ("Water (Hot)",  "Hot water serial")]:
+            if serial_col not in wdf.columns:
+                continue
+            out = pd.DataFrame()
+            out["stand"]           = wdf["Stand"].astype(str).str.strip()
+            out["unit_type"]       = block_col
+            out["wbho_section"]    = block_col          # no DB info for water
+            out["manufacturer"]    = ""
+            out["model"]           = ""
+            out["serial"]          = wdf[serial_col].astype(str).str.strip().replace("nan","")
+            out["commission_date"] = pd.NaT
+            out["amr"]             = wdf["AMR installed"].fillna(False).astype(bool)
+            out["deadline"]        = pd.NaT
+            out["faulty"]          = False
+            out["faulty_replaced"] = False
+            out["replacement_date"]= pd.NaT
+            out["meter_type"]      = meter_subtype
+            out["installed"]       = out["serial"].str.len().gt(0) & out["serial"].ne("nan")
+            out = out[out["stand"].notna() & (out["stand"] != "") & (out["stand"].str.lower() != "nan")]
+            records.append(out)
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.concat(records, ignore_index=True)
+
+    # Status: apartments have no deadlines, so just installed/not
+    def status_row(r):
+        return "Installed" if r["installed"] else "On track"
+
+    df["status"]           = df.apply(status_row, axis=1)
+    df["days_to_deadline"] = None
+    return df
+
+
 @st.cache_data(show_spinner=False)
-def load_kiosk_data(file_path, _mtime):
+def load_aprt_reticulation(file_path, _mtime):
+    """Build Block → DB → meters hierarchy for the apartment reticulation diagram."""
+    xls = pd.ExcelFile(file_path)
+    elec_name = find_sheet(xls, APRT_ELEC_CANDIDATES)
+    if not elec_name:
+        return {}
+
+    edf = xls.parse(elec_name)
+    edf.columns = [str(c).strip() for c in edf.columns]
+    edf["serial_str"] = edf["Elect meter serial"].astype(str).str.strip()
+    edf["stand_str"]  = edf["Stand"].astype(str).str.strip()
+    edf["block"]      = edf["Apartment Block"].astype(str).str.strip()
+    edf["db"]         = edf["Parent DB"].astype(str).str.strip()
+    edf["amr"]        = edf["AMR installed"].fillna(False).astype(bool)
+    edf["parent_meter"] = edf["Parent Meter"].astype(str).str.strip()
+
+    hierarchy = {}
+    for block, block_grp in edf.groupby("block"):
+        hierarchy[block] = {}
+        for db, db_grp in block_grp.groupby("db"):
+            parent_m = db_grp["parent_meter"].iloc[0] if not db_grp.empty else ""
+            hierarchy[block][db] = {
+                "parent_meter": parent_m,
+                "meters": db_grp["stand_str"].tolist(),
+                "serials": dict(zip(db_grp["stand_str"], db_grp["serial_str"])),
+                "amr_meters": db_grp[db_grp["amr"]]["stand_str"].tolist(),
+                "total": len(db_grp),
+                "amr_count": int(db_grp["amr"].sum()),
+            }
+    return hierarchy
+
+
+
     """Build the minisub → kiosk → meters hierarchy for the reticulation diagram."""
     xls = pd.ExcelFile(file_path)
 
@@ -1344,59 +1461,95 @@ def summary_counters(view_df, full_df, label):
     c4.metric("Matching current filters", shown_n)
 
 
-# ---------- Load data ----------
+# ---------- Site selector ----------
 st.title("🔧 Sitari Evergreen — Meter Commissioning")
 st.caption("Erf 1186 Sitari · Lifestyle Retirement Village")
 
+col_title, col_switch = st.columns([3, 1])
+with col_switch:
+    site_type = st.radio(
+        "View", ["🏠 Freestanding", "🏢 Apartments"],
+        horizontal=True, key="site_type",
+        label_visibility="collapsed"
+    )
+site_key = "freestanding" if "Freestanding" in site_type else "apartments"
+is_apartments = site_key == "apartments"
+
+# ---------- Load data ----------
 data_path = find_data_file()
 if not data_path:
     st.error(f"No file matching `{FILE_PATTERN}` found in this app's folder. Push the latest spreadsheet to the repo to continue.")
     st.stop()
 
 mtime = os.path.getmtime(data_path)
-df = load_data(data_path, mtime)
+df = load_data(data_path, mtime, site_key)
 
 if df.empty:
-    st.error("Couldn't find a 'Water meters' or 'Elec Meters' tab in this file. Check the sheet names.")
+    st.error("Couldn't find the required sheets in this file. Check the sheet names.")
     st.stop()
 
-st.caption(f"📂 Using **{os.path.basename(data_path)}** · last updated {datetime.fromtimestamp(mtime).strftime('%d %b %Y, %H:%M')}")
+st.caption(
+    f"📂 Using **{os.path.basename(data_path)}** · last updated {datetime.fromtimestamp(mtime).strftime('%d %b %Y, %H:%M')}"
+    + (" · 🏢 Apartments view" if is_apartments else " · 🏠 Freestanding view")
+)
 
 # ---------- KPI strip (always visible) ----------
 total = len(df)
-installed_n = int(df["installed"].sum())
-overdue_n = int((df["status"] == "Overdue").sum())
-due_soon_n = int((df["status"] == "Due soon").sum())
+installed_n   = int(df["installed"].sum())
+overdue_n     = int((df["status"] == "Overdue").sum())
+due_soon_n    = int((df["status"] == "Due soon").sum())
 outstanding_n = total - installed_n
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Total meter points", total)
-c2.metric("Installed", installed_n, f"{round(installed_n/total*100)}% complete")
-c3.metric("Outstanding", outstanding_n)
-c4.metric("Due within 14 days", due_soon_n)
-c5.metric("Overdue", overdue_n, delta_color="inverse")
-faulty_n = int(df["faulty"].sum()) if "faulty" in df.columns else 0
-faulty_pending_n = int(df[df["faulty"] & ~df["faulty_replaced"]]["stand"].count()) if "faulty" in df.columns else 0
-c6.metric("Faulty meters", faulty_n, f"{faulty_pending_n} awaiting replacement", delta_color="inverse")
+if is_apartments:
+    ca1, ca2, ca3, ca4 = st.columns(4)
+    ca1.metric("Total meter points", total)
+    ca2.metric("Installed (serial present)", installed_n, f"{round(installed_n/total*100) if total else 0}% complete")
+    ca3.metric("AMR commissioned", int(df["amr"].sum()) if "amr" in df.columns else 0)
+    water_types = df[df["meter_type"].str.startswith("Water")]["meter_type"].nunique()
+    ca4.metric("Meter types", f"Elec · Cold · Hot")
+else:
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Total meter points", total)
+    c2.metric("Installed", installed_n, f"{round(installed_n/total*100) if total else 0}% complete")
+    c3.metric("Outstanding", outstanding_n)
+    c4.metric("Due within 14 days", due_soon_n)
+    c5.metric("Overdue", overdue_n, delta_color="inverse")
+    faulty_n         = int(df["faulty"].sum()) if "faulty" in df.columns else 0
+    faulty_pending_n = int(df[df["faulty"] & ~df["faulty_replaced"]]["stand"].count()) if "faulty" in df.columns else 0
+    c6.metric("Faulty meters", faulty_n, f"{faulty_pending_n} awaiting replacement", delta_color="inverse")
 
 st.divider()
 
 # ---------- Tabs ----------
-tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic, tab_map, tab_faulty, tab_amr = st.tabs(
-    ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed", "📅 Calendar", "📊 Sections", "⚡ Reticulation", "🗺️ Estate Map", "⚠️ Faulty Meters", "📡 AMR Live"]
-)
+if is_apartments:
+    tab_installed, tab_aprt_retic, tab_amr = st.tabs(
+        ["🟩 Installed", "🏢 Apt Reticulation", "📡 AMR Live"]
+    )
+    # Unused stubs for apartment mode (tabs don't exist, set to None)
+    tab_outstanding = tab_upcoming = tab_overdue = tab_calendar = None
+    tab_sections = tab_retic = tab_map = tab_faulty = None
+else:
+    tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic, tab_map, tab_faulty, tab_amr = st.tabs(
+        ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed",
+         "📅 Calendar", "📊 Sections", "⚡ Reticulation", "🗺️ Estate Map",
+         "⚠️ Faulty Meters", "📡 AMR Live"]
+    )
+    tab_aprt_retic = None
 
-COLS = ["stand", "meter_type", "unit_type", "wbho_section", "deadline", "status"]
-RENAME = {"stand": "Stand", "meter_type": "Type", "unit_type": "Unit type", "wbho_section": "Section", "deadline": "Deadline (Snag 4)", "status": "Status"}
+COLS   = ["stand", "meter_type", "unit_type", "wbho_section", "deadline", "status"]
+RENAME = {"stand":"Stand","meter_type":"Type","unit_type":"Unit type",
+          "wbho_section":"Section","deadline":"Deadline (Snag 4)","status":"Status"}
 
-with tab_outstanding:
+if not is_apartments:
+ with tab_outstanding:
     st.subheader("All outstanding meters")
     outstanding_full = df[~df["installed"]]
     filtered = status_filters(outstanding_full, "outstanding")
     summary_counters(filtered, outstanding_full, "outstanding")
     show_table(filtered, COLS, RENAME, sort_col="deadline")
 
-with tab_upcoming:
+if not is_apartments:
+ with tab_upcoming:
     st.subheader("Due within the next 14 days")
     due_soon_full = df[df["status"] == "Due soon"]
     filtered = status_filters(due_soon_full, "upcoming")
@@ -1412,7 +1565,8 @@ with tab_upcoming:
             with st.expander(f"Week of {week_start.strftime('%d %b')} – {week_end.strftime('%d %b %Y')} · {len(group)} meters"):
                 show_table(group, COLS, RENAME, sort_col="deadline")
 
-with tab_overdue:
+if not is_apartments:
+ with tab_overdue:
     st.subheader("Behind schedule — past Snag Date 4, not yet installed")
     overdue_full = df[df["status"] == "Overdue"]
     filtered = status_filters(overdue_full, "overdue")
@@ -1457,7 +1611,8 @@ with tab_installed:
         sort_col="commission_date", ascending=False,
     )
 
-with tab_calendar:
+if not is_apartments:
+ with tab_calendar:
     st.subheader("Calendar view")
     st.caption("✅ installed · 🟧 upcoming deadline · 🟥 overdue deadline — based on Snag Date 4")
 
@@ -1512,7 +1667,8 @@ with tab_calendar:
         html += "</table>"
         st.markdown(html, unsafe_allow_html=True)
 
-with tab_sections:
+if not is_apartments:
+ with tab_sections:
     st.subheader("Section progress (WBHO subsections)")
     section_meter_type = st.radio("Meter type", ["All", "Water", "Electrical"], horizontal=True, key="sec_type")
     sec_df = df if section_meter_type == "All" else df[df["meter_type"] == section_meter_type]
@@ -1555,7 +1711,8 @@ st.caption("Reads the spreadsheet pushed into this repo folder. Push an updated 
 # =====================================================================
 # RETICULATION TAB — single-line diagram: Minisubs → Kiosks → Meters
 # =====================================================================
-with tab_retic:
+if not is_apartments:
+ with tab_retic:
     st.subheader("⚡ Electrical Reticulation — Single Line Diagram")
     st.caption("Supply → Minisub → Kiosk → Meters. Click a kiosk to expand stands. Click a stand chip to see its meter serial.")
 
@@ -2098,7 +2255,8 @@ if (highlightStands.size > 0) {{
 # =====================================================================
 # ESTATE MAP TAB
 # =====================================================================
-with tab_map:
+if not is_apartments:
+ with tab_map:
     st.subheader("\U0001f5fa\ufe0f Estate Map \u2014 Installation Status")
 
     # Auto-load KML from repo folder, fall back to upload
@@ -2247,7 +2405,8 @@ with tab_map:
 # =====================================================================
 # FAULTY METERS TAB
 # =====================================================================
-with tab_faulty:
+if not is_apartments:
+ with tab_faulty:
     st.subheader("⚠️ Faulty Meter Log")
     st.caption(
         "All meters flagged as faulty in the spreadsheet. "
@@ -2843,3 +3002,171 @@ with tab_amr:
                                 key=f"dl_hist_{selected_stand}_{mtype}_{hashlib.md5(rc).hexdigest()[:6]}")
 
         st.caption("Auto-refreshes hourly. History stored permanently in Supabase.")
+
+# =====================================================================
+# APARTMENT RETICULATION TAB
+# =====================================================================
+if is_apartments and tab_aprt_retic is not None:
+ with tab_aprt_retic:
+    st.subheader("🏢 Apartment Reticulation — Block → DB → Meters")
+    st.caption("Hierarchy: Apartment Block → Distribution Board → Individual meters. "
+               "Click a DB to expand its meters. Coloured by AMR status.")
+
+    aprt_hier = load_aprt_reticulation(data_path, mtime)
+
+    if not aprt_hier:
+        st.warning("No apartment electrical data found. Check 'Aprt Elec' sheet.")
+    else:
+        # Build AMR status lookup from current readings
+        amr_status_lookup = {}
+        if "amr_readings" in st.session_state:
+            _rdgs = st.session_state.get("amr_readings", {})
+        else:
+            _rdgs = {}
+
+        # KPIs
+        total_aprt_meters = sum(db["total"] for block in aprt_hier.values()
+                                for db in block.values())
+        total_aprt_amr    = sum(db["amr_count"] for block in aprt_hier.values()
+                                for db in block.values())
+        ak1, ak2, ak3 = st.columns(3)
+        ak1.metric("Total apartment meters", total_aprt_meters)
+        ak2.metric("AMR commissioned",       total_aprt_amr)
+        ak3.metric("Blocks",                 len(aprt_hier))
+
+        st.divider()
+
+        # Build JSON for the HTML diagram
+        import json
+        aprt_diagram = []
+        for block_name in sorted(aprt_hier.keys()):
+            dbs = aprt_hier[block_name]
+            db_list = []
+            for db_name in sorted(dbs.keys()):
+                db = dbs[db_name]
+                db_list.append({
+                    "db": db_name,
+                    "parent_meter": db["parent_meter"],
+                    "total": db["total"],
+                    "amr_count": db["amr_count"],
+                    "meters": db["meters"],
+                    "serials": db["serials"],
+                    "amr_meters": db["amr_meters"],
+                })
+            aprt_diagram.append({"block": block_name, "dbs": db_list})
+
+        diagram_json = json.dumps(aprt_diagram)
+
+        html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>
+*{{box-sizing:border-box;margin:0;padding:0;}}
+body{{font-family:'IBM Plex Mono','Courier New',monospace;background:#0e1117;color:#e0e0e0;padding:12px;}}
+.blocks-row{{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start;justify-content:center;}}
+.block-col{{display:flex;flex-direction:column;align-items:center;min-width:200px;max-width:280px;flex:1;}}
+.block-box{{background:#1F3F66;border:2px solid #5B86B3;border-radius:10px;padding:10px 16px;
+           text-align:center;width:100%;margin-bottom:8px;}}
+.block-title{{font-size:14px;font-weight:700;color:#fff;}}
+.block-sub{{font-size:10px;color:#7A96B2;margin-top:3px;}}
+.vline{{width:3px;height:16px;background:#5B86B3;}}
+.db-list{{width:100%;display:flex;flex-direction:column;gap:0;}}
+.db-drop{{width:3px;height:14px;background:#5B86B3;margin:0 auto;}}
+.db-node{{width:100%;background:#131c2b;border:1.5px solid #334d6e;border-radius:7px;
+          cursor:pointer;padding:7px 10px;transition:border-color .15s,background .15s;}}
+.db-node:hover{{border-color:#5B86B3;background:#1a2840;}}
+.db-node.expanded{{border-color:#E69138;}}
+.db-header{{display:flex;align-items:center;gap:6px;}}
+.db-name{{font-size:11px;font-weight:700;color:#c8d8eb;flex:1;}}
+.mini-bar{{flex:1;height:4px;border-radius:2px;background:#2a3f55;overflow:hidden;}}
+.mini-fill{{height:100%;border-radius:2px;}}
+.db-counts{{font-size:9px;color:#7A96B2;white-space:nowrap;}}
+.chevron{{font-size:9px;color:#5B86B3;transition:transform .2s;}}
+.chevron.open{{transform:rotate(180deg);}}
+.db-detail{{display:none;background:#0d1520;border:1px solid #1e3050;
+            border-top:none;border-radius:0 0 7px 7px;padding:7px 9px;}}
+.db-detail.open{{display:block;}}
+.meter-grid{{display:flex;flex-wrap:wrap;gap:3px;margin-top:4px;}}
+.meter-chip{{padding:1px 5px;border-radius:4px;font-size:9px;font-weight:600;
+             display:inline-flex;align-items:center;gap:2px;cursor:pointer;}}
+.chip-amr{{background:#3F7D5C22;color:#6eb88a;border:1px solid #3F7D5C55;}}
+.chip-no-amr{{background:#1F3F6622;color:#7a9ec4;border:1px solid #334d6e;}}
+.dot{{display:inline-block;width:5px;height:5px;border-radius:50%;}}
+.dot-amr{{background:#3F7D5C;}}
+.dot-no{{background:#334d6e;}}
+.parent-serial{{font-size:9px;color:#5B86B3;margin-top:4px;}}
+.detail-header{{font-size:8px;color:#5B86B3;margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em;}}
+</style></head><body>
+<div class="blocks-row" id="root"></div>
+<script>
+const data = {diagram_json};
+function pct(a,t){{return t>0?Math.round(a/t*100):0;}}
+function barColor(p){{return p>=100?'#3F7D5C':p>=60?'#5B86B3':p>=30?'#E69138':'#BD4B2C';}}
+
+data.forEach(block=>{{
+  const col = document.createElement('div');
+  col.className='block-col';
+
+  const box = document.createElement('div');
+  box.className='block-box';
+  const p = pct(block.dbs.reduce((s,d)=>s+d.amr_count,0), block.dbs.reduce((s,d)=>s+d.total,0));
+  box.innerHTML=`<div class="block-title">${{block.block}}</div>
+    <div class="block-sub">${{block.dbs.reduce((s,d)=>s+d.total,0)}} meters · ${{p}}% AMR</div>`;
+  col.appendChild(box);
+
+  const vl=document.createElement('div'); vl.className='vline'; col.appendChild(vl);
+
+  const dbList=document.createElement('div'); dbList.className='db-list';
+  block.dbs.forEach(db=>{{
+    const drop=document.createElement('div'); drop.className='db-drop'; dbList.appendChild(drop);
+    const node=document.createElement('div'); node.className='db-node';
+    const dp=pct(db.amr_count, db.total);
+    node.innerHTML=`<div class="db-header">
+      <span class="db-name">${{db.db}}</span>
+      <div class="mini-bar"><div class="mini-fill" style="width:${{dp}}%;background:${{barColor(dp)}}"></div></div>
+      <span class="db-counts">${{db.amr_count}}/${{db.total}}</span>
+      <span class="chevron" id="chev-${{db.db}}">▾</span>
+    </div>
+    ${{db.parent_meter?`<div class="parent-serial">Parent: ${{db.parent_meter}}</div>`:''}}`; 
+
+    const detail=document.createElement('div');
+    detail.className='db-detail';
+    detail.id='det-'+db.db;
+    const amrSet=new Set(db.amr_meters);
+    const chips=db.meters.map(m=>{{
+      const isAmr=amrSet.has(m);
+      const serial=(db.serials&&db.serials[m])||'';
+      return `<span class="meter-chip ${{isAmr?'chip-amr':'chip-no-amr'}}"
+        title="${{m}} · Serial: ${{serial||'—'}} · AMR: ${{isAmr?'Yes':'No'}}">
+        <span class="dot ${{isAmr?'dot-amr':'dot-no'}}"></span>${{m.split('/').pop()}}</span>`;
+    }}).join('');
+    detail.innerHTML=`<div class="detail-header">${{db.total}} meters · ${{db.amr_count}} AMR</div>
+      <div class="meter-grid">${{chips}}</div>`;
+
+    node.addEventListener('click',()=>{{
+      const d=document.getElementById('det-'+db.db);
+      const c=document.getElementById('chev-'+db.db);
+      const open=d.classList.toggle('open');
+      node.classList.toggle('expanded',open);
+      if(c)c.classList.toggle('open',open);
+    }});
+    dbList.appendChild(node);
+    dbList.appendChild(detail);
+  }});
+  col.appendChild(dbList);
+  document.getElementById('root').appendChild(col);
+}});
+</script></body></html>"""
+        components.html(html, height=750, scrolling=True)
+
+# =====================================================================
+# APARTMENT INSTALLED TAB (when in apartment mode)
+# =====================================================================
+if is_apartments:
+ with tab_installed:
+    st.subheader("🟩 Apartment meters — installed list")
+    for mtype in sorted(df["meter_type"].unique()):
+        sub = df[df["meter_type"]==mtype]
+        inst = sub[sub["installed"]]
+        with st.expander(f"**{mtype}** — {len(inst)}/{len(sub)} installed"):
+            disp = inst[["stand","unit_type","wbho_section","serial","amr"]].rename(
+                columns={"stand":"Stand","unit_type":"Block","wbho_section":"DB/Block","serial":"Serial","amr":"AMR"})
+            st.dataframe(disp, use_container_width=True, hide_index=True)
