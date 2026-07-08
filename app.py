@@ -721,7 +721,9 @@ def load_kiosk_data(file_path, _mtime):
     kp["planned"] = pd.to_numeric(kp["New planned units"], errors="coerce").fillna(0).astype(int)
 
     # --- Elec Meters (installed counts per kiosk, stand list, AMR) ---
-    elec_name = find_sheet(xls, ["Elec Meters", "Electrical Meters"])
+    elec_name = find_sheet(xls, ELEC_SHEET_CANDIDATES)
+    if not elec_name:
+        return {}
     edf = xls.parse(elec_name)
     edf.columns = [str(c).strip() for c in edf.columns]
     edf = edf[edf["Kiosk Number"].notna()].copy()
@@ -2466,7 +2468,8 @@ if not is_apartments:
             # Re-load kiosk number per stand from the Excel file directly
             try:
                 _xls = pd.ExcelFile(data_path)
-                _edf = _xls.parse("Elec Meters")
+                _elec_sheet_name = find_sheet(_xls, ELEC_SHEET_CANDIDATES)
+                _edf = _xls.parse(_elec_sheet_name)
                 _edf.columns = [str(c).strip() for c in _edf.columns]
                 _edf["stand_str"] = _edf["Stand Number"].astype(str).str.strip()
                 kiosk_stands_map = (
