@@ -3220,26 +3220,38 @@ if is_apartments and tab_aprt_retic is not None:
         aprt_diagram = []
         for block_name in sorted(aprt_hier.keys()):
             e = aprt_hier[block_name]
+            # Every check meter under the bulk becomes a node: DBs (with children),
+            # plus Lifts / UPS / Plant (usually no child meters — shown standalone).
             db_list = []
+            for chk_name in sorted(e["checks"].keys()):
+                c = e["checks"][chk_name]
+                d = e["dbs"].get(chk_name)
+                db_list.append({
+                    "db": chk_name,
+                    "check_serial": c["serial"],
+                    "check_amr": c["amr"],
+                    "total": d["total"] if d else 0,
+                    "amr_count": d["amr_count"] if d else 0,
+                    "meters": d["meters"] if d else [],
+                    "serials": d["serials"] if d else {},
+                    "amr_meters": d["amr_meters"] if d else [],
+                })
+            # Any DB group without a matching check meter row (data gap) still shown
             for db_name in sorted(e["dbs"].keys()):
+                if db_name in e["checks"]:
+                    continue
                 d = e["dbs"][db_name]
                 db_list.append({
-                    "db": db_name,
-                    "check_serial": d["check_serial"],
-                    "check_amr": d["check_amr"],
-                    "total": d["total"], "amr_count": d["amr_count"],
-                    "meters": d["meters"], "serials": d["serials"],
-                    "amr_meters": d["amr_meters"],
+                    "db": db_name, "check_serial": d["check_serial"],
+                    "check_amr": d["check_amr"], "total": d["total"],
+                    "amr_count": d["amr_count"], "meters": d["meters"],
+                    "serials": d["serials"], "amr_meters": d["amr_meters"],
                 })
             aprt_diagram.append({
                 "block": block_name.strip(),
                 "label": BLOCK_LABEL_AR.get(block_name.strip(), ""),
                 "minisub": e["minisub"] or {"name": "?", "serial": ""},
                 "bulk": e["bulk"] or {"stand": "Bulk", "serial": "", "amr": False},
-                "checks_extra": [
-                    {"name": n, "serial": c["serial"], "amr": c["amr"]}
-                    for n, c in sorted(e["checks"].items()) if n not in e["dbs"]
-                ],
                 "dbs": db_list,
             })
         diagram_json = _json_ar.dumps(aprt_diagram)
@@ -3312,40 +3324,40 @@ data.forEach(b => {{
     const node=document.createElement('div'); node.className='db-node';
     const dp = pct(d.amr_count, d.total);
     const dbId = (b.block + '-' + d.db).replace(/[^a-zA-Z0-9]/g,'');
+    const hasKids = d.meters && d.meters.length > 0;
     node.innerHTML = `<div class="db-header">
       <span class="db-name">${{d.db}}</span>
       <span class="db-serial">${{d.check_serial}}</span>
       <div class="mini-bar"><div class="mini-fill" style="width:${{dp}}%"></div></div>
-      <span class="db-counts">${{d.amr_count}}/${{d.total}}</span>
-      <span style="font-size:9px;color:#5B86B3" id="chev-${{dbId}}">▾</span>
+      <span class="db-counts">${{hasKids ? d.amr_count + '/' + d.total : (d.check_amr ? 'AMR ✓' : 'no AMR')}}</span>
+      ${{hasKids ? `<span style="font-size:9px;color:#5B86B3" id="chev-${{dbId}}">▾</span>` : ''}}
     </div>`;
 
     const det=document.createElement('div'); det.className='db-detail'; det.id='det-'+dbId;
-    const amrSet=new Set(d.amr_meters);
-    const chips=d.meters.map(m => {{
-      const ok=amrSet.has(m); const serial=(d.serials&&d.serials[m])||'';
-      return `<span class="meter-chip ${{ok?'chip-amr':'chip-no'}}"
-        title="${{m}} · Serial ${{serial||'—'}} · AMR ${{ok?'✓':'pending'}}">
-        <span class="dot" style="background:${{ok?'#3F7D5C':'#334d6e'}}"></span>${{m.split('/').pop()}}</span>`;
-    }}).join('');
-    det.innerHTML = `<div style="font-size:8px;color:#8B5CF6;margin-bottom:3px">
-      CHECK METER ${{d.check_serial}} → ${{d.total}} apartment meters (${{d.amr_count}} AMR)</div>
-      <div class="meter-grid">${{chips}}</div>`;
-
-    node.addEventListener('click', () => {{
-      const open = det.classList.toggle('open');
-      node.classList.toggle('expanded', open);
-    }});
+    if (hasKids) {{
+      const amrSet=new Set(d.amr_meters);
+      const chips=d.meters.map(m => {{
+        const ok=amrSet.has(m); const serial=(d.serials&&d.serials[m])||'';
+        return `<span class="meter-chip ${{ok?'chip-amr':'chip-no'}}"
+          title="${{m}} · Serial ${{serial||'—'}} · AMR ${{ok?'✓':'pending'}}">
+          <span class="dot" style="background:${{ok?'#3F7D5C':'#334d6e'}}"></span>${{m.split('/').pop()}}</span>`;
+      }}).join('');
+      det.innerHTML = `<div style="font-size:8px;color:#8B5CF6;margin-bottom:3px">
+        CHECK METER ${{d.check_serial}} → ${{d.total}} apartment meters (${{d.amr_count}} AMR)</div>
+        <div class="meter-grid">${{chips}}</div>`;
+      node.addEventListener('click', () => {{
+        const open = det.classList.toggle('open');
+        node.classList.toggle('expanded', open);
+      }});
+    }} else {{
+      node.style.cursor = 'default';
+      det.innerHTML = `<div style="font-size:8px;color:#5B86B3">
+        No child meters allocated to this check meter yet.</div>`;
+    }}
     dbList.appendChild(node); dbList.appendChild(det);
   }});
   col.appendChild(dbList);
 
-  if (b.checks_extra && b.checks_extra.length) {{
-    const extra = document.createElement('div'); extra.className='extra-note';
-    extra.innerHTML = 'Other check meters: ' + b.checks_extra.map(c =>
-      `${{c.name}} (${{c.serial}})`).join(' · ');
-    col.appendChild(extra);
-  }}
 
   document.getElementById('root').appendChild(col);
 }});
@@ -3493,26 +3505,48 @@ with tab_balance:
                 continue
             bulk_serial = e["bulk"]["serial"]
 
-            # Level 2: bulk vs sum of DB check meters
-            check_deltas, check_missing = [], 0
+            # Level 2: bulk vs ALL check meters under it — sub-DBs plus
+            # Lifts / UPS / Plant (they draw from the bulk too)
+            all_checks = dict(e["checks"])   # name → {serial, amr}
+            # DB groups whose check meter row is missing from the sheet still count
             for dbn, d in e["dbs"].items():
-                cd = _delta(d["check_serial"])
+                if dbn not in all_checks:
+                    all_checks[dbn] = {"serial": d["check_serial"], "amr": d["check_amr"]}
+
+            check_deltas, check_missing = [], 0
+            for cname, c in all_checks.items():
+                cd = _delta(c["serial"])
                 if cd is None:
                     check_missing += 1
                 else:
                     check_deltas.append(cd)
+
             with st.expander(f"🏢 {blk} · bulk {bulk_serial}", expanded=False):
-                _bal_row(f"{blk} Bulk vs DB check meters", bulk_serial,
-                         sum(check_deltas), check_missing)
+                _bal_row(f"{blk} Bulk vs all check meters (DBs + Lifts/UPS/Plant)",
+                         bulk_serial, sum(check_deltas), check_missing)
                 st.markdown("---")
-                st.markdown("**Per-DB: check meter vs apartment meters**")
-                for dbn in sorted(e["dbs"].keys()):
-                    d = e["dbs"][dbn]
-                    apt_deltas = [_delta(s) for s in d["serials"].values()]
-                    apt_have   = [x for x in apt_deltas if x is not None]
-                    apt_miss   = len(apt_deltas) - len(apt_have)
-                    _bal_row(f"{dbn} ({d['check_serial']})", d["check_serial"],
-                             sum(apt_have), apt_miss, indent=1)
+                st.markdown("**Per check meter: usage, and vs child meters where allocated**")
+                for cname in sorted(all_checks.keys()):
+                    c = all_checks[cname]
+                    d = e["dbs"].get(cname)
+                    if d:
+                        # DB with allocated apartment meters → full balancing row
+                        apt_deltas = [_delta(s) for s in d["serials"].values()]
+                        apt_have   = [x for x in apt_deltas if x is not None]
+                        apt_miss   = len(apt_deltas) - len(apt_have)
+                        _bal_row(f"{cname} ({c['serial']})", c["serial"],
+                                 sum(apt_have), apt_miss, indent=1)
+                    else:
+                        # Lift / UPS / Plant, or DB with no children yet → own usage only
+                        cd = _delta(c["serial"])
+                        cc = st.columns([2.4, 1.2, 1.2, 1.2, 2])
+                        cc[0].markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**{cname}** ({c['serial']})",
+                                       unsafe_allow_html=True)
+                        cc[1].markdown(f"Usage: **{cd:,.1f}** kWh" if cd is not None else "Usage: *no reading*")
+                        cc[2].markdown("—")
+                        cc[3].markdown("—")
+                        cc[4].caption("end-point load (no child meters)" if cd is not None
+                                      else "no child meters · no reading yet")
 
         st.caption(
             "Consumption = last reading − first reading per serial within the window. "
@@ -3522,7 +3556,7 @@ with tab_balance:
         )
 
 # =====================================================================
-# APARTMENT FLOOR PLAN TAB — clickable schematic + AMR history
+# APARTMENT FLOOR PLAN TAB — clickable Plotly schematic + AMR history
 # =====================================================================
 if is_apartments and tab_floorplan is not None:
  with tab_floorplan:
@@ -3548,11 +3582,10 @@ if is_apartments and tab_floorplan is not None:
     amr_flag_by_stand = dict(zip(_fp_df["stand"], _fp_df["amr"]))
 
     import re as _re_fp
-    import json as _json_fp
-    from urllib.parse import quote as _q
+    import plotly.graph_objects as _go_fp
 
     BLOCK_NAMES = {"A": "Block A · Helderberg Suites", "B": "Block B · Tafelberg Suites"}
-    FLOOR_LABEL = {"00": "Ground Floor", "01": "First Floor", "02": "Second Floor"}
+    FLOOR_LABEL = {"00": "Ground", "01": "First", "02": "Second"}
 
     blocks_fp = {}
     for stand in df["stand"].unique():
@@ -3569,123 +3602,84 @@ if is_apartments and tab_floorplan is not None:
             color, label = "#33415c", "AMR not fitted"
         blocks_fp.setdefault(blk, {}).setdefault(floor, []).append({
             "unit": unit, "unit_str": m.group(3), "stand": stand,
-            "stand_url": _q(stand, safe=""),
             "serial": serial, "color": color, "label": label,
             "value": reading.get("reading_value") if reading else None,
             "low_bat": int(reading.get("low_battery", 0)) if reading else 0,
         })
 
-    fp_json = _json_fp.dumps({
-        "blocks": [
-            {"id": blk, "name": BLOCK_NAMES.get(blk, f"Block {blk}"),
-             "floors": [
-                 {"id": fl, "label": FLOOR_LABEL.get(fl, fl),
-                  "units": sorted(blocks_fp[blk][fl], key=lambda u: u["unit"])}
-                 for fl in sorted(blocks_fp[blk].keys(), reverse=True)
-             ]}
-            for blk in sorted(blocks_fp.keys())
-        ],
-        "meter_type": fp_type,
-    })
+    def _fp_wing(n):
+        n = n % 100
+        return 0 if n <= 14 else 1 if n <= 28 else 2
 
-    fp_html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
-<style>
-*{{box-sizing:border-box;margin:0;padding:0;}}
-body{{font-family:'IBM Plex Mono','Courier New',monospace;background:#0e1117;color:#e0e0e0;padding:10px;}}
-.block-wrap{{margin-bottom:30px;}}
-.block-title{{font-size:15px;font-weight:700;color:#c8d8eb;margin-bottom:2px;}}
-.block-sub{{font-size:10px;color:#5B86B3;margin-bottom:10px;}}
-.floor{{margin-bottom:14px;}}
-.floor-label{{font-size:10px;color:#7A96B2;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;}}
-.floor-body{{background:#131c2b;border:1.5px solid #26364d;border-radius:8px;padding:8px 10px;}}
-.row{{display:flex;gap:3px;align-items:center;margin:2px 0;}}
-.row-label{{font-size:8px;color:#44586f;width:32px;flex-shrink:0;}}
-.wing-gap{{width:20px;flex-shrink:0;display:flex;align-items:center;justify-content:center;}}
-.wing-gap::after{{content:'';width:2px;height:20px;background:#26364d;}}
-a.unit{{width:34px;height:24px;border-radius:4px;display:flex;align-items:center;justify-content:center;
-       font-size:8.5px;font-weight:700;color:#fff;cursor:pointer;position:relative;
-       text-shadow:0 0 3px rgba(0,0,0,.7);flex-shrink:0;text-decoration:none;
-       transition:transform .08s;}}
-a.unit:hover{{transform:scale(1.18);z-index:5;outline:1.5px solid #fff;}}
-a.unit.lowbat{{outline:2px dashed #FFF176;outline-offset:-2px;}}
-a.unit:hover .tip{{display:block;}}
-.tip{{display:none;position:absolute;bottom:112%;left:50%;transform:translateX(-50%);
-     background:#0a0f18;border:1px solid #3a4f6a;border-radius:6px;padding:6px 9px;
-     font-size:9px;font-weight:400;color:#c8d8eb;white-space:nowrap;z-index:50;
-     box-shadow:0 4px 14px rgba(0,0,0,.6);text-shadow:none;}}
-.passage{{height:8px;display:flex;align-items:center;padding:0 40px;}}
-.passage-line{{flex:1;border-top:1px dashed #33415c;position:relative;}}
-.passage-text{{position:absolute;top:-6px;left:50%;transform:translateX(-50%);
-              font-size:7px;color:#44586f;background:#131c2b;padding:0 6px;letter-spacing:.15em;}}
-.legend{{display:flex;flex-wrap:wrap;gap:14px;font-size:10px;margin-top:6px;padding:6px 2px;}}
-.lg{{display:flex;align-items:center;gap:4px;}}
-.sw{{width:12px;height:12px;border-radius:3px;display:inline-block;}}
-</style></head><body>
-<div id="root"></div>
-<div class="legend">
-  <span class="lg"><span class="sw" style="background:#2E7D52"></span>&lt;24h</span>
-  <span class="lg"><span class="sw" style="background:#D4AC0D"></span>1–3d</span>
-  <span class="lg"><span class="sw" style="background:#E67E22"></span>4–7d</span>
-  <span class="lg"><span class="sw" style="background:#BD4B2C"></span>7d+</span>
-  <span class="lg"><span class="sw" style="background:#607080"></span>AMR fitted, never seen</span>
-  <span class="lg"><span class="sw" style="background:#33415c"></span>AMR not fitted</span>
-  <span class="lg"><span class="sw" style="outline:2px dashed #FFF176;outline-offset:-2px"></span>Low battery</span>
-  <span class="lg" style="color:#7A96B2">· Click a unit for its usage graphs</span>
-</div>
-<script>
-const data = {fp_json};
-const root = document.getElementById('root');
-function wingOf(u){{ const n = u % 100; return n <= 14 ? 0 : n <= 28 ? 1 : 2; }}
+    clicked_stand = None
+    for blk in sorted(blocks_fp.keys()):
+        st.markdown(f"**🏢 {BLOCK_NAMES.get(blk, 'Block ' + blk)}** — {fp_type}")
 
-data.blocks.forEach(block => {{
-  const bw = document.createElement('div'); bw.className = 'block-wrap';
-  bw.innerHTML = `<div class="block-title">🏢 ${{block.name}}</div>
-    <div class="block-sub">${{data.meter_type}} meters · click a unit to open its graphs</div>`;
+        xs, ys, colors, texts, customs, hovers, line_colors, line_widths = [], [], [], [], [], [], [], []
+        floor_annotations = []
+        floors_sorted = sorted(blocks_fp[blk].keys(), reverse=True)   # Second at top
 
-  block.floors.forEach(floor => {{
-    const f = document.createElement('div'); f.className = 'floor';
-    f.innerHTML = `<div class="floor-label">${{floor.label}}</div>`;
-    const body = document.createElement('div'); body.className = 'floor-body';
-    const odd  = floor.units.filter(u => u.unit % 2 === 1);
-    const even = floor.units.filter(u => u.unit % 2 === 0);
+        for fi, fl in enumerate(floors_sorted):
+            y_base = (len(floors_sorted) - 1 - fi) * 3   # 6, 3, 0 bottom-up
+            floor_annotations.append((y_base + 0.5, FLOOR_LABEL.get(fl, fl)))
+            for u in blocks_fp[blk][fl]:
+                n = u["unit"] % 100
+                is_odd = n % 2 == 1
+                col_idx = (n + 1) // 2 - 1 if is_odd else n // 2 - 1
+                x = col_idx + _fp_wing(u["unit"]) * 1.6
+                y = y_base + (1 if is_odd else 0)
+                xs.append(x); ys.append(y)
+                colors.append(u["color"])
+                texts.append(u["unit_str"])
+                customs.append(u["stand"])
+                _uv = u["value"]; _ust = u["stand"]; _use = u["serial"] or "—"; _ul = u["label"]
+                val_s = f"<br>Reading: {_uv}" if _uv is not None else ""
+                bat_s = "<br>🔋 Low battery" if u["low_bat"] else ""
+                hovers.append(f"<b>{_ust}</b><br>Serial: {_use}"
+                              f"<br>{_ul}{val_s}{bat_s}<br><i>Click for graphs ↓</i>")
+                line_colors.append("#FFF176" if u["low_bat"] else "#0e1117")
+                line_widths.append(2.5 if u["low_bat"] else 1)
 
-    function buildRow(units, lblTxt) {{
-      const row = document.createElement('div'); row.className = 'row';
-      const lbl = document.createElement('span'); lbl.className = 'row-label';
-      lbl.textContent = lblTxt; row.appendChild(lbl);
-      let lastWing = -1;
-      units.forEach(u => {{
-        const w = wingOf(u.unit);
-        if (lastWing !== -1 && w !== lastWing) {{
-          const gap = document.createElement('span'); gap.className = 'wing-gap';
-          row.appendChild(gap);
-        }}
-        lastWing = w;
-        const cell = document.createElement('a');
-        cell.className = 'unit' + (u.low_bat ? ' lowbat' : '');
-        cell.style.background = u.color;
-        cell.href = '?sel_stand=' + u.stand_url + '&view=apartments';
-        cell.target = '_parent';
-        cell.innerHTML = `${{u.unit_str}}<span class="tip">
-          <b>${{u.stand}}</b><br>Serial: ${{u.serial || '—'}}<br>${{u.label}}
-          ${{u.value !== null && u.value !== undefined ? '<br>Reading: ' + u.value : ''}}
-          ${{u.low_bat ? '<br>🔋 Low battery' : ''}}<br><i>Click for graphs ↓</i></span>`;
-        row.appendChild(cell);
-      }});
-      return row;
-    }}
+        fig = _go_fp.Figure(_go_fp.Scatter(
+            x=xs, y=ys, mode="markers+text",
+            marker=dict(symbol="square", size=26, color=colors,
+                        line=dict(color=line_colors, width=line_widths)),
+            text=texts, textfont=dict(size=8, color="white", family="monospace"),
+            customdata=customs,
+            hovertemplate="%{hovertext}<extra></extra>", hovertext=hovers,
+        ))
+        for ya, lbl in floor_annotations:
+            fig.add_annotation(x=-1.8, y=ya, text=lbl, showarrow=False,
+                               font=dict(size=10, color="#7A96B2"), textangle=-90)
+        fig.update_layout(
+            height=330, margin=dict(l=10, r=10, t=8, b=8),
+            plot_bgcolor="#0E1117", paper_bgcolor="#0E1117",
+            xaxis=dict(visible=False, range=[-2.5, 25]),
+            yaxis=dict(visible=False, range=[-0.8, len(floors_sorted) * 3 - 0.2]),
+            showlegend=False, dragmode=False,
+        )
+        ev = st.plotly_chart(fig, use_container_width=True,
+                             on_select="rerun", selection_mode="points",
+                             key=f"fp_plot_{blk}")
+        try:
+            pts = ev.selection.points if ev and ev.selection else []
+        except Exception:
+            pts = []
+        if pts:
+            clicked_stand = pts[0].get("customdata")
 
-    body.appendChild(buildRow(odd, 'ODD'));
-    const pass = document.createElement('div'); pass.className = 'passage';
-    pass.innerHTML = '<div class="passage-line"><span class="passage-text">PASSAGE</span></div>';
-    body.appendChild(pass);
-    body.appendChild(buildRow(even, 'EVEN'));
-    f.appendChild(body); bw.appendChild(f);
-  }});
-  root.appendChild(bw);
-}});
-</script></body></html>"""
-    components.html(fp_html, height=980, scrolling=True)
+    # Legend
+    st.markdown(
+        "<div style='display:flex;flex-wrap:wrap;gap:14px;font-size:11px'>"
+        "<span>🟩 &lt;24h</span><span>🟨 1–3d</span><span>🟧 4–7d</span><span>🟥 7d+</span>"
+        "<span><span style='display:inline-block;width:11px;height:11px;background:#607080;border-radius:2px'></span> AMR fitted, never seen</span>"
+        "<span><span style='display:inline-block;width:11px;height:11px;background:#33415c;border-radius:2px'></span> AMR not fitted</span>"
+        "<span><span style='display:inline-block;width:11px;height:11px;outline:2px solid #FFF176;outline-offset:-2px;border-radius:2px'></span> Low battery</span>"
+        "</div>", unsafe_allow_html=True)
+
+    if clicked_stand:
+        st.session_state["fp_stand_select"] = clicked_stand
+        st.session_state["fp_selected_stand"] = clicked_stand
 
     st.divider()
 
