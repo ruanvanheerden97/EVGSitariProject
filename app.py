@@ -275,6 +275,43 @@ def load_latest_from_db():
         return {}
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def db_get_consumption(start_iso, end_iso):
+    """
+    Per-serial consumption over a window: last reading minus first reading.
+    Returns {serial: {"delta": float, "first": v, "last": v, "n": count}}.
+    Serials with fewer than 2 readings in the window are omitted (treated as no data).
+    """
+    if not PSYCOPG2_AVAILABLE or not _get_db_url():
+        return {}
+    try:
+        conn = _db_conn()
+        df = pd.read_sql_query(
+            """SELECT serial, reading_date, reading_value
+               FROM amr_readings
+               WHERE reading_date >= %s AND reading_date <= %s
+                 AND reading_value IS NOT NULL
+               ORDER BY serial, reading_date""",
+            conn, params=(start_iso, end_iso)
+        )
+        conn.close()
+        result = {}
+        if df.empty:
+            return result
+        for serial, grp in df.groupby("serial"):
+            if len(grp) < 2:
+                continue
+            first_v = float(grp["reading_value"].iloc[0])
+            last_v  = float(grp["reading_value"].iloc[-1])
+            result[str(serial)] = {
+                "delta": max(last_v - first_v, 0.0),
+                "first": first_v, "last": last_v, "n": len(grp),
+            }
+        return result
+    except Exception:
+        return {}
+
+
 def _parse_csv_filename_ts(name):
     """Extract datetime from SIT_YYYYMMDD_HHMMSS.csv → datetime or None."""
     m = CSV_FILENAME_RE.match(os.path.basename(name))
@@ -485,6 +522,75 @@ def save_amr_cache(data):
     except Exception:
         pass
 
+# =====================================================================
+# SHARED: stand history renderer (graphs + raw readings for a stand)
+# =====================================================================
+def render_stand_history(stand, df_all, key_prefix="hist"):
+    """Show usage charts + raw readings for every meter (all types) on a stand."""
+    import plotly.graph_objects as go
+    import hashlib as _hl
+
+    stand_meters = df_all[(df_all["stand"] == stand) & df_all["serial"].str.len().gt(0)]
+    stand_meters = stand_meters.drop_duplicates(subset=["meter_type"])
+    if stand_meters.empty:
+        st.info(f"No meters with serials found for {stand}.")
+        return
+
+    for _, r in stand_meters.iterrows():
+        serial = r["serial"]
+        mtype  = r["meter_type"]
+        unit   = "kWh" if mtype == "Electrical" else "Litres"
+        hist_df = db_get_history(serial)
+        if hist_df.empty:
+            st.caption(f"**{mtype}** · serial `{serial}` — no readings in history yet.")
+            continue
+        hist_df = hist_df.copy()
+        hist_df["consumption"] = hist_df["reading_value"].diff().clip(lower=0)
+        hist_df["gap_hours"]   = hist_df["reading_date"].diff().dt.total_seconds() / 3600
+
+        t_chart, t_raw = st.tabs([f"📈 {mtype} ({len(hist_df)} readings)", f"📋 {mtype} raw"])
+        with t_chart:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=hist_df["reading_date"], y=hist_df["reading_value"],
+                mode="lines+markers", name=f"Reading ({unit})",
+                line=dict(color="#5B86B3" if mtype == "Electrical" else "#2E7D52", width=2),
+                marker=dict(size=4)))
+            fig.add_trace(go.Bar(x=hist_df["reading_date"], y=hist_df["consumption"],
+                name="Usage/interval", marker_color="#E69138", opacity=0.5, yaxis="y2"))
+            gaps = hist_df[hist_df["gap_hours"] > 3]
+            if not gaps.empty:
+                fig.add_trace(go.Scatter(x=gaps["reading_date"], y=gaps["reading_value"],
+                    mode="markers", name="Gap >3h",
+                    marker=dict(color="#BD4B2C", size=10, symbol="x")))
+            lbat = hist_df[hist_df["low_battery"] == 1]
+            if not lbat.empty:
+                fig.add_trace(go.Scatter(x=lbat["reading_date"], y=lbat["reading_value"],
+                    mode="markers", name="Low battery",
+                    marker=dict(color="#FFF176", size=8, symbol="triangle-down")))
+            fig.update_layout(
+                title=f"{stand} · {mtype} · {serial}",
+                yaxis_title=unit,
+                yaxis2=dict(title=f"Usage ({unit})", overlaying="y", side="right", showgrid=False),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                plot_bgcolor="#0E1117", paper_bgcolor="#0E1117",
+                font=dict(color="#E0E0E0"), xaxis=dict(gridcolor="#1E2D3D"),
+                yaxis=dict(gridcolor="#1E2D3D"), height=340, margin=dict(t=60, b=20))
+            st.plotly_chart(fig, use_container_width=True,
+                            key=f"{key_prefix}_fig_{stand}_{mtype}")
+        with t_raw:
+            raw = hist_df[["reading_date","reading_value","low_battery","gap_hours"]].copy()
+            raw.columns = ["Date/Time", f"Reading ({unit})", "Low bat", "Gap (h)"]
+            raw["Date/Time"] = raw["Date/Time"].dt.strftime("%d %b %Y %H:%M")
+            raw["Low bat"]   = raw["Low bat"].map({1: "🔋", 0: ""})
+            raw["Gap (h)"]   = raw["Gap (h)"].fillna(0).round(1)
+            st.dataframe(raw.sort_values("Date/Time", ascending=False),
+                         use_container_width=True, hide_index=True, height=260)
+            rc = raw.to_csv(index=False).encode("utf-8")
+            st.download_button(f"⬇️ {mtype} history", rc,
+                file_name=f"{stand}_{mtype.lower().replace(' ','_')}_history.csv",
+                key=f"{key_prefix}_dl_{stand}_{mtype}_{_hl.md5(rc).hexdigest()[:6]}")
+
+
 def amr_status_info(reading_date_iso):
     """
     Return (label, color_hex, badge_class) based on hours since last reading.
@@ -676,7 +782,15 @@ def _load_apartment_data(xls):
 
 @st.cache_data(show_spinner=False)
 def load_aprt_reticulation(file_path, _mtime):
-    """Build Block → DB → meters hierarchy for the apartment reticulation diagram."""
+    """
+    Build the 3-level apartment hierarchy from the Aprt Elec sheet:
+        Minisub  →  Block Bulk Meter  →  DB check meters  →  apartment meters
+    Row conventions in the sheet:
+      - Parent DB in ('MS1','MS2')           → that row IS the block bulk meter
+      - Parent DB == 'Block X Bulk Meter'    → that row is a DB check meter (stand = DB name)
+      - Parent DB == 'DB-...'                → apartment meter fed from that DB
+    Returns {block: {minisub, bulk, checks, dbs}}.
+    """
     xls = pd.ExcelFile(file_path)
     elec_name = find_sheet(xls, APRT_ELEC_CANDIDATES)
     if not elec_name:
@@ -684,31 +798,53 @@ def load_aprt_reticulation(file_path, _mtime):
 
     edf = xls.parse(elec_name)
     edf.columns = [str(c).strip() for c in edf.columns]
-    edf["serial_str"] = edf["Elect meter serial"].astype(str).str.strip()
-    edf["stand_str"]  = edf["Stand"].astype(str).str.strip()
-    edf["block"]      = edf["Apartment Block"].astype(str).str.strip()
-    edf["db"]         = edf["Parent DB"].astype(str).str.strip()
-    edf["amr"]        = edf["AMR installed"].fillna(False).astype(bool)
+    edf["serial_str"]   = edf["Elect meter serial"].astype(str).str.strip()
+    edf["stand_str"]    = edf["Stand"].astype(str).str.strip()
+    edf["block"]        = edf["Apartment Block"].astype(str).str.strip()
+    edf["db"]           = edf["Parent DB"].astype(str).str.strip()
+    edf["amr"]          = edf["AMR installed"].fillna(False).astype(bool)
     edf["parent_meter"] = edf["Parent Meter"].astype(str).str.strip()
 
+    MS_NAMES = {"MS1", "MS2", "MS3"}
     hierarchy = {}
-    for block, block_grp in edf.groupby("block"):
-        hierarchy[block] = {}
-        for db, db_grp in block_grp.groupby("db"):
-            parent_m = db_grp["parent_meter"].iloc[0] if not db_grp.empty else ""
-            hierarchy[block][db] = {
-                "parent_meter": parent_m,
-                "meters": db_grp["stand_str"].tolist(),
-                "serials": dict(zip(db_grp["stand_str"], db_grp["serial_str"])),
-                "amr_meters": db_grp[db_grp["amr"]]["stand_str"].tolist(),
-                "total": len(db_grp),
-                "amr_count": int(db_grp["amr"].sum()),
+    for block, bgrp in edf.groupby("block"):
+        entry = {"minisub": None, "bulk": None, "checks": {}, "dbs": {}}
+
+        # Bulk meter row: Parent DB is a minisub
+        bulk_rows = bgrp[bgrp["db"].isin(MS_NAMES)]
+        if not bulk_rows.empty:
+            br = bulk_rows.iloc[0]
+            entry["bulk"] = {"stand": br["stand_str"], "serial": br["serial_str"],
+                             "amr": bool(br["amr"])}
+            entry["minisub"] = {"name": br["db"], "serial": br["parent_meter"]}
+
+        bulk_group_name = entry["bulk"]["stand"] if entry["bulk"] else None
+
+        # DB check meters: rows whose Parent DB is the bulk meter stand name
+        if bulk_group_name:
+            for _, cr in bgrp[bgrp["db"] == bulk_group_name].iterrows():
+                entry["checks"][cr["stand_str"]] = {
+                    "serial": cr["serial_str"], "amr": bool(cr["amr"]),
+                }
+
+        # Apartment DB groups: everything else
+        skip = MS_NAMES | ({bulk_group_name} if bulk_group_name else set())
+        for db, dgrp in bgrp[~bgrp["db"].isin(skip)].groupby("db"):
+            entry["dbs"][db] = {
+                "parent_meter": dgrp["parent_meter"].iloc[0],
+                "check_serial": entry["checks"].get(db, {}).get("serial", dgrp["parent_meter"].iloc[0]),
+                "check_amr":    entry["checks"].get(db, {}).get("amr", False),
+                "meters":       dgrp["stand_str"].tolist(),
+                "serials":      dict(zip(dgrp["stand_str"], dgrp["serial_str"])),
+                "amr_meters":   dgrp[dgrp["amr"]]["stand_str"].tolist(),
+                "total":        len(dgrp),
+                "amr_count":    int(dgrp["amr"].sum()),
             }
+        hierarchy[block] = entry
     return hierarchy
 
 
-@st.cache_data(show_spinner=False)
-def load_kiosk_data(file_path, _mtime):
+
     """Build the minisub → kiosk → meters hierarchy for the reticulation diagram."""
     xls = pd.ExcelFile(file_path)
 
@@ -721,9 +857,7 @@ def load_kiosk_data(file_path, _mtime):
     kp["planned"] = pd.to_numeric(kp["New planned units"], errors="coerce").fillna(0).astype(int)
 
     # --- Elec Meters (installed counts per kiosk, stand list, AMR) ---
-    elec_name = find_sheet(xls, ELEC_SHEET_CANDIDATES)
-    if not elec_name:
-        return {}
+    elec_name = find_sheet(xls, ["Elec Meters", "Electrical Meters"])
     edf = xls.parse(elec_name)
     edf.columns = [str(c).strip() for c in edf.columns]
     edf = edf[edf["Kiosk Number"].notna()].copy()
@@ -1468,6 +1602,15 @@ def summary_counters(view_df, full_df, label):
 st.title("🔧 Sitari Evergreen — Meter Commissioning")
 st.caption("Erf 1186 Sitari · Lifestyle Retirement Village")
 
+# Handle stand-click links from the apartment floor plan (query params).
+# Must run BEFORE the radio is instantiated so we can steer it to Apartments.
+_qp_stand = st.query_params.get("sel_stand")
+if _qp_stand:
+    st.session_state["fp_selected_stand"] = _qp_stand
+    if st.query_params.get("view") == "apartments":
+        st.session_state["site_type"] = "🏢 Apartments"
+    st.query_params.clear()
+
 col_title, col_switch = st.columns([3, 1])
 with col_switch:
     site_type = st.radio(
@@ -1525,17 +1668,17 @@ st.divider()
 
 # ---------- Tabs ----------
 if is_apartments:
-    tab_installed, tab_aprt_retic, tab_floorplan, tab_amr = st.tabs(
-        ["🟩 Installed", "🏢 Apt Reticulation", "🏬 Floor Plan", "📡 AMR Live"]
+    tab_floorplan, tab_installed, tab_aprt_retic, tab_balance, tab_amr = st.tabs(
+        ["🏬 Floor Plan", "🟩 Installed", "🏢 Apt Reticulation", "⚖️ Balancing", "📡 AMR Live"]
     )
     # Unused stubs for apartment mode (tabs don't exist, set to None)
     tab_outstanding = tab_upcoming = tab_overdue = tab_calendar = None
     tab_sections = tab_retic = tab_map = tab_faulty = None
 else:
-    tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic, tab_map, tab_faulty, tab_amr = st.tabs(
+    tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic, tab_map, tab_faulty, tab_balance, tab_amr = st.tabs(
         ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed",
          "📅 Calendar", "📊 Sections", "⚡ Reticulation", "🗺️ Estate Map",
-         "⚠️ Faulty Meters", "📡 AMR Live"]
+         "⚠️ Faulty Meters", "⚖️ Balancing", "📡 AMR Live"]
     )
     tab_aprt_retic = None
     tab_floorplan = None
@@ -1770,31 +1913,24 @@ if not is_apartments:
 
     diagram_data = []
 
-    # Apartment blocks hang off the minisubs: Block A ← MS2, Block B ← MS1
+    # Apartment block BULK meters hang off the minisubs (Block A ← MS2, Block B ← MS1)
     aprt_hier_fs = load_aprt_reticulation(data_path, mtime)
-    BLOCK_TO_MS = {"Block A": 2, "Block B": 1}
-    BLOCK_LABEL = {"Block A": "Block A · Helderberg Suites", "Block B": "Block B · Tafelberg Suites"}
-    ms_aprt_blocks = {}   # ms_id → block payload
-    for _bname, _dbs in (aprt_hier_fs or {}).items():
-        _bkey = _bname.strip()
-        _ms_id = BLOCK_TO_MS.get(_bkey)
-        if _ms_id is None:
+    BLOCK_LABEL_FS = {"Block A": "Helderberg Suites", "Block B": "Tafelberg Suites"}
+    ms_aprt_blocks = {}
+    for _bname, _entry in (aprt_hier_fs or {}).items():
+        if not _entry.get("bulk") or not _entry.get("minisub"):
             continue
-        _db_list = []
-        for _dbname in sorted(_dbs.keys()):
-            _db = _dbs[_dbname]
-            _db_list.append({
-                "db": _dbname,
-                "parent_meter": _db["parent_meter"],
-                "total": _db["total"],
-                "amr_count": _db["amr_count"],
-            })
+        try:
+            _ms_id = int(str(_entry["minisub"]["name"]).upper().replace("MS", ""))
+        except ValueError:
+            continue
         ms_aprt_blocks[_ms_id] = {
-            "block": _bkey,
-            "label": BLOCK_LABEL.get(_bkey, _bkey),
-            "total": sum(d["total"] for d in _db_list),
-            "amr_count": sum(d["amr_count"] for d in _db_list),
-            "dbs": _db_list,
+            "block": _bname.strip(),
+            "label": BLOCK_LABEL_FS.get(_bname.strip(), _bname.strip()),
+            "bulk_serial": _entry["bulk"]["serial"],
+            "bulk_amr": bool(_entry["bulk"]["amr"]),
+            "total": sum(d["total"] for d in _entry["dbs"].values()),
+            "amr_count": sum(d["amr_count"] for d in _entry["dbs"].values()),
         }
 
     for ms_id in sorted(hierarchy.keys()):
@@ -2117,6 +2253,34 @@ function buildDiagram() {{
     const grid = document.createElement('div');
     grid.className = 'kiosk-grid';
 
+    // ── Apartment block bulk meter — rendered FIRST, at the top ──
+    if (ms.aprt_block) {{
+      const ab = ms.aprt_block;
+      const abEntry = document.createElement('div');
+      abEntry.className = 'kiosk-entry';
+      const abDrop = document.createElement('div');
+      abDrop.className = 'kiosk-drop-line';
+      abDrop.style.background = '#8B5CF6';
+      abEntry.appendChild(abDrop);
+
+      const abNode = document.createElement('div');
+      abNode.className = 'kiosk-node';
+      abNode.style.borderColor = '#8B5CF6';
+      abNode.style.background = '#181330';
+      abNode.style.cursor = 'default';
+      abNode.innerHTML = `
+        <div class="kiosk-header">
+          <span class="kiosk-id" style="color:#A78BFA">🏢 ${{ab.block}} Bulk</span>
+          <span class="kiosk-counts" style="font-family:monospace">${{ab.bulk_serial}}</span>
+        </div>
+        <div class="kiosk-amr-line">
+          <span style="color:#A78BFA">${{ab.label}} · ${{ab.total}} apt meters · ${{ab.amr_count}} AMR</span>
+          ${{!ab.bulk_amr ? '<span class="amr-miss-count">⚠ bulk AMR pending</span>' : ''}}
+        </div>`;
+      abEntry.appendChild(abNode);
+      grid.appendChild(abEntry);
+    }}
+
     ms.kiosks.forEach(k => {{
       const entry = document.createElement('div');
       entry.className = 'kiosk-entry';
@@ -2258,70 +2422,6 @@ function buildDiagram() {{
       entry.appendChild(detail);
       grid.appendChild(entry);
     }});
-
-    // ── Apartment block node (Block A ← MS2, Block B ← MS1) ──
-    if (ms.aprt_block) {{
-      const ab = ms.aprt_block;
-      const abEntry = document.createElement('div');
-      abEntry.className = 'kiosk-entry';
-
-      const abDrop = document.createElement('div');
-      abDrop.className = 'kiosk-drop-line';
-      abDrop.style.background = '#8B5CF6';
-      abEntry.appendChild(abDrop);
-
-      const abPct = pct(ab.amr_count, ab.total);
-      const abNode = document.createElement('div');
-      abNode.className = 'kiosk-node';
-      abNode.style.borderColor = '#8B5CF6';
-      abNode.style.background = '#1a1530';
-      abNode.innerHTML = `
-        <div class="kiosk-header">
-          <span class="kiosk-id" style="color:#A78BFA">🏢 ${{ab.block}}</span>
-          <div class="kiosk-bar-wrap">
-            <div class="kiosk-mini-bar">
-              <div class="kiosk-mini-fill" style="width:${{abPct}}%; background:#8B5CF6"></div>
-            </div>
-          </div>
-          <span class="kiosk-counts">${{ab.amr_count}}/${{ab.total}}</span>
-          <span class="kiosk-chevron" id="chev-ab-${{ab.block.replace(/\\s/g,'')}}">▾</span>
-        </div>
-        <div class="kiosk-amr-line">
-          <span style="color:#A78BFA">${{ab.label}}</span>
-        </div>`;
-
-      const abDetail = document.createElement('div');
-      abDetail.className = 'kiosk-detail';
-      abDetail.id = 'detail-ab-' + ab.block.replace(/\\s/g,'');
-      const dbRows = ab.dbs.map(d => {{
-        const dpc = pct(d.amr_count, d.total);
-        return `<div style="display:flex;align-items:center;gap:6px;padding:2px 0;font-size:10px">
-          <span style="color:#c8d8eb;min-width:130px;font-weight:600">${{d.db}}</span>
-          <div style="flex:1;height:4px;border-radius:2px;background:#2a3f55;overflow:hidden">
-            <div style="height:100%;width:${{dpc}}%;background:#8B5CF6"></div>
-          </div>
-          <span style="color:#7A96B2;white-space:nowrap">${{d.amr_count}}/${{d.total}} AMR</span>
-          ${{d.parent_meter && d.parent_meter !== 'nan' ? '<span style="color:#5B86B3;font-family:monospace;font-size:9px">' + d.parent_meter + '</span>' : ''}}
-        </div>`;
-      }}).join('');
-      abDetail.innerHTML = `
-        <div style="font-size:9px;color:#A78BFA;margin-bottom:4px;">
-          DISTRIBUTION BOARDS (${{ab.dbs.length}}) · switch to 🏢 Apartments view for full detail
-        </div>
-        ${{dbRows}}`;
-
-      abNode.addEventListener('click', function() {{
-        const d = document.getElementById('detail-ab-' + ab.block.replace(/\\s/g,''));
-        const chev = document.getElementById('chev-ab-' + ab.block.replace(/\\s/g,''));
-        const open = d.classList.toggle('open');
-        abNode.classList.toggle('expanded', open);
-        if (chev) chev.classList.toggle('open', open);
-      }});
-
-      abEntry.appendChild(abNode);
-      abEntry.appendChild(abDetail);
-      grid.appendChild(abEntry);
-    }}
 
     col.appendChild(grid);
     root.appendChild(col);
@@ -2468,8 +2568,7 @@ if not is_apartments:
             # Re-load kiosk number per stand from the Excel file directly
             try:
                 _xls = pd.ExcelFile(data_path)
-                _elec_sheet_name = find_sheet(_xls, ELEC_SHEET_CANDIDATES)
-                _edf = _xls.parse(_elec_sheet_name)
+                _edf = _xls.parse("Elec Meters")
                 _edf.columns = [str(c).strip() for c in _edf.columns]
                 _edf["stand_str"] = _edf["Stand Number"].astype(str).str.strip()
                 kiosk_stands_map = (
@@ -2896,6 +2995,23 @@ with tab_amr:
         k6.metric("⚫ Never",  len(never),  f"{round(len(never)/total_amr_inst*100) if total_amr_inst else 0}%")
         k7.metric("🔧 AMR pending", len(amr_pending_df), "meter in, AMR not fitted")
 
+        # ── Per-type summary rows (Electricity / Water / Hot Water separately) ──
+        _type_icons = {"Electrical": "⚡", "Water": "💧", "Water (Cold)": "💧", "Water (Hot)": "♨️"}
+        for _tname in sorted(amr_table["meter_type"].unique().tolist()):
+            _tsub  = amr_table[amr_table["meter_type"] == _tname]
+            _tpend = amr_pending_df[amr_pending_df["meter_type"] == _tname]
+            _tcnt  = _tsub["status_badge"].value_counts()
+            _ttot  = len(_tsub)
+            _tg    = int(_tcnt.get("amr-green", 0))
+            t1, t2, t3, t4, t5, t6, t7 = st.columns(7)
+            t1.metric(f"{_type_icons.get(_tname,'')} {_tname}", _ttot)
+            t2.metric("🟢 <24h",  _tg, f"{round(_tg/_ttot*100) if _ttot else 0}%")
+            t3.metric("🟡 1–3d",  int(_tcnt.get("amr-yellow", 0)))
+            t4.metric("🟠 4–7d",  int(_tcnt.get("amr-orange", 0)))
+            t5.metric("🔴 7d+",   int(_tcnt.get("amr-red", 0)))
+            t6.metric("⚫ Never", int(_tcnt.get("amr-never", 0)))
+            t7.metric("🔧 Pending", len(_tpend))
+
         low_bat_meters   = amr_table[amr_table["low_battery"]==1]
         stale_and_faulty = amr_table[amr_table["status_badge"].isin(["amr-orange","amr-red","amr-never"]) &
                                      amr_table["stand"].isin(faulty_pending_stands)]
@@ -2920,8 +3036,9 @@ with tab_amr:
             st.markdown("##### Filters & detail")
             af1, af2 = st.columns(2)
             with af1:
-                a_type = st.multiselect("Type",["Water","Electrical"],
-                                        default=["Water","Electrical"],key="amr_type")
+                _types_present = sorted(amr_table["meter_type"].unique().tolist()) if not amr_table.empty else sorted(df["meter_type"].unique().tolist())
+                a_type = st.multiselect("Type", _types_present,
+                                        default=_types_present, key="amr_type")
             with af2:
                 a_status = st.multiselect("Status",
                     ["🟢 Last 24h","🟡 1–3 days","🟠 4–7 days","🔴 7+ days","⚫ No reading"],
@@ -2997,16 +3114,41 @@ with tab_amr:
             if not _amr_polygons:
                 st.info("No KML found — push `EVG_Sitari.kml` to see the map.")
             else:
-                _amr_map_df = df.copy() if len(a_type)==2 else df[df["meter_type"].isin(a_type)]
+                _amr_map_df = df.copy() if len(a_type) == len(_types_present) else df[df["meter_type"].isin(a_type)]
                 _center = kml_center(_amr_polygons,_amr_kiosks,[])
-                _gh = _poly_hash(_amr_polygons,_amr_kiosks)
-                _dh = _df_hash(_amr_map_df)
-                _ah = _amr_hash(amr_readings)
-                _fph = str(sorted(faulty_pending_df["stand"].tolist())) if not faulty_pending_df.empty else ""
-                with st.spinner("Building map…"):
-                    amr_map_html = cached_amr_map_html(_gh,_dh,_ah,_fph,_center,
-                        _amr_polygons,_amr_kiosks,_amr_map_df,amr_readings,faulty_pending_df)
-                    render_cached_map(amr_map_html, height=500)
+
+                if not is_apartments:
+                    # Clickable map: st_folium returns the clicked popup so a stand
+                    # click auto-opens its history below. Map object cached by resource.
+                    @st.cache_resource(show_spinner=False)
+                    def _cached_amr_map_obj(geom_h, df_h, amr_h, f_h):
+                        return build_amr_map(_amr_polygons, _amr_kiosks, _amr_map_df,
+                                             amr_readings, faulty_pending_df, _center)
+                    _gh = _poly_hash(_amr_polygons,_amr_kiosks)
+                    _dh = _df_hash(_amr_map_df)
+                    _ah = _amr_hash(amr_readings)
+                    _fph = str(sorted(faulty_pending_df["stand"].tolist())) if not faulty_pending_df.empty else ""
+                    with st.spinner("Building map…"):
+                        _mobj = _cached_amr_map_obj(_gh, _dh, _ah, _fph)
+                        map_ret = st_folium(_mobj, use_container_width=True, height=500,
+                                            returned_objects=["last_object_clicked_popup"],
+                                            key="amr_click_map")
+                    _clicked = (map_ret or {}).get("last_object_clicked_popup") or ""
+                    if _clicked:
+                        import re as _re_click
+                        _mm = _re_click.search(r"Stand ID:\s*(\w+)", str(_clicked))
+                        if _mm:
+                            st.session_state["amr_selected_stand"] = _mm.group(1)
+                    st.caption("💡 Click any stand polygon to open its water & electricity graphs below.")
+                else:
+                    _gh = _poly_hash(_amr_polygons,_amr_kiosks)
+                    _dh = _df_hash(_amr_map_df)
+                    _ah = _amr_hash(amr_readings)
+                    _fph = str(sorted(faulty_pending_df["stand"].tolist())) if not faulty_pending_df.empty else ""
+                    with st.spinner("Building map…"):
+                        amr_map_html = cached_amr_map_html(_gh,_dh,_ah,_fph,_center,
+                            _amr_polygons,_amr_kiosks,_amr_map_df,amr_readings,faulty_pending_df)
+                        render_cached_map(amr_map_html, height=500)
                 leg = "<div style='display:flex;flex-wrap:wrap;gap:10px;font-size:11px;margin-top:4px'>"
                 for col,lbl in [("#2E7D52","🟢 <24h"),("#D4AC0D","🟡 1–3d"),("#E67E22","🟠 4–7d"),
                                  ("#BD4B2C","🔴 7d+"),("#607080","⚫ Never"),("#EF4444","⚠️ Faulty")]:
@@ -3018,246 +3160,194 @@ with tab_amr:
         st.divider()
 
         # ── Stand history (full width) ─────────────────────────────────
-        st.markdown("##### Stand reading history")
-        stand_options = sorted(amr_table["stand"].unique().tolist())
-        default_stand = st.session_state.get("amr_selected_stand", stand_options[0] if stand_options else None)
+        st.markdown("##### Stand reading history — water & electricity")
+        # All stands with any serial (not only AMR-commissioned), so any map click resolves
+        _hist_pool = df[df["installed"] & df["serial"].str.len().gt(0)]
+        stand_options = sorted(_hist_pool["stand"].unique().tolist())
+        default_stand = st.session_state.get("amr_selected_stand",
+                                             stand_options[0] if stand_options else None)
         if default_stand not in stand_options and stand_options:
             default_stand = stand_options[0]
 
-        h_left, h_right = st.columns([1,3])
-        with h_left:
-            selected_stand = st.selectbox("Select stand",options=stand_options,
+        sel_col, info_col = st.columns([1, 2.4])
+        with sel_col:
+            selected_stand = st.selectbox(
+                "Select stand (auto-set when you click the map)",
+                options=stand_options,
                 index=stand_options.index(default_stand) if default_stand in stand_options else 0,
                 key="amr_stand_select")
             if selected_stand:
                 st.session_state["amr_selected_stand"] = selected_stand
-                stand_row = amr_table[amr_table["stand"]==selected_stand]
-                if not stand_row.empty:
-                    r0 = stand_row.iloc[0]
-                    _,color_h,_ = amr_status_info(r0["last_reading"])
-                    st.markdown(
-                        f"**{r0['unit_type']}** · {r0['wbho_section']}  \nSerial: `{r0['serial']}`  \n"
-                        f"<span style='background:{color_h}22;color:{color_h};padding:1px 8px;border-radius:8px;"
-                        f"font-size:12px;font-weight:600'>{r0['status_label']}</span>"
-                        + (" &nbsp;⚠️ **Faulty**" if selected_stand in faulty_pending_stands else ""),
-                        unsafe_allow_html=True)
+        with info_col:
+            total_rows_db, _, mn, mx = db_stats()
+            st.caption(f"History DB: **{total_rows_db:,}** readings · "
+                       f"{mn[:10] if mn else '—'} → {mx[:10] if mx else '—'}"
+                       + (" · ⚠️ Faulty meter on this stand" if selected_stand in faulty_pending_stands else ""))
 
-        with h_right:
-            if selected_stand:
-                serials = amr_table[amr_table["stand"]==selected_stand]["serial"].dropna().unique().tolist()
-                serials = [s for s in serials if s and s not in ("nan","None","")]
-                if not serials:
-                    st.info("No serial recorded for this stand.")
-                else:
-                    import plotly.graph_objects as go
-                    total_rows_db,_,mn,mx = db_stats()
-                    st.caption(f"History DB: **{total_rows_db:,}** readings · {mn[:10] if mn else '—'} → {mx[:10] if mx else '—'}")
-                    for serial in serials:
-                        hist_df = db_get_history(serial)
-                        mtype_rows = amr_table[(amr_table["stand"]==selected_stand)&(amr_table["serial"]==serial)]
-                        mtype = mtype_rows["meter_type"].iloc[0] if not mtype_rows.empty else "Unknown"
-                        unit  = "Litres" if mtype=="Water" else "kWh"
-                        if hist_df.empty:
-                            st.info(f"No history yet for {serial}. Builds up with each hourly fetch.")
-                            continue
-                        hist_df = hist_df.copy()
-                        hist_df["consumption"] = hist_df["reading_value"].diff().clip(lower=0)
-                        hist_df["gap_hours"]   = hist_df["reading_date"].diff().dt.total_seconds()/3600
-                        tab_chart, tab_raw = st.tabs([f"📈 {mtype} ({len(hist_df)} readings)","📋 Raw"])
-                        with tab_chart:
-                            fig = go.Figure()
-                            fig.add_trace(go.Scatter(x=hist_df["reading_date"],y=hist_df["reading_value"],
-                                mode="lines+markers",name=f"Reading ({unit})",
-                                line=dict(color="#2E7D52" if mtype=="Water" else "#5B86B3",width=2),
-                                marker=dict(size=4)))
-                            fig.add_trace(go.Bar(x=hist_df["reading_date"],y=hist_df["consumption"],
-                                name="Usage/interval",marker_color="#E69138",opacity=0.5,yaxis="y2"))
-                            gaps = hist_df[hist_df["gap_hours"]>3]
-                            if not gaps.empty:
-                                fig.add_trace(go.Scatter(x=gaps["reading_date"],y=gaps["reading_value"],
-                                    mode="markers",name="Gap >3h",marker=dict(color="#BD4B2C",size=10,symbol="x")))
-                            lbat = hist_df[hist_df["low_battery"]==1]
-                            if not lbat.empty:
-                                fig.add_trace(go.Scatter(x=lbat["reading_date"],y=lbat["reading_value"],
-                                    mode="markers",name="Low bat",marker=dict(color="#FFF176",size=8,symbol="triangle-down")))
-                            fig.update_layout(
-                                title=f"Stand {selected_stand} · {mtype} · {serial}",
-                                xaxis_title=None,yaxis_title=unit,
-                                yaxis2=dict(title=f"Usage ({unit})",overlaying="y",side="right",showgrid=False),
-                                legend=dict(orientation="h",yanchor="bottom",y=1.02),
-                                plot_bgcolor="#0E1117",paper_bgcolor="#0E1117",
-                                font=dict(color="#E0E0E0"),xaxis=dict(gridcolor="#1E2D3D"),
-                                yaxis=dict(gridcolor="#1E2D3D"),height=340,margin=dict(t=60,b=20))
-                            st.plotly_chart(fig,use_container_width=True)
-                        with tab_raw:
-                            raw_disp = hist_df[["reading_date","reading_value","low_battery","gap_hours"]].copy()
-                            raw_disp.columns = ["Date/Time",f"Reading ({unit})","Low bat","Gap (h)"]
-                            raw_disp["Date/Time"] = raw_disp["Date/Time"].dt.strftime("%d %b %Y %H:%M")
-                            raw_disp["Low bat"]   = raw_disp["Low bat"].map({1:"\U0001f50b",0:""})
-                            raw_disp["Gap (h)"]   = raw_disp["Gap (h)"].fillna(0).round(1)
-                            st.dataframe(raw_disp.sort_values("Date/Time",ascending=False),
-                                         use_container_width=True,hide_index=True,height=260)
-                            import hashlib
-                            rc = raw_disp.to_csv(index=False).encode("utf-8")
-                            st.download_button(f"\u2b07\ufe0f {mtype} history",rc,
-                                file_name=f"stand_{selected_stand}_{mtype.lower()}_history.csv",
-                                key=f"dl_hist_{selected_stand}_{mtype}_{hashlib.md5(rc).hexdigest()[:6]}")
+        if selected_stand:
+            render_stand_history(selected_stand, df, key_prefix="amr")
 
         st.caption("Auto-refreshes hourly. History stored permanently in Supabase.")
 
 # =====================================================================
-# APARTMENT RETICULATION TAB
+# APARTMENT RETICULATION TAB — 3 levels: Minisub → Bulk → DBs → meters
 # =====================================================================
 if is_apartments and tab_aprt_retic is not None:
  with tab_aprt_retic:
-    st.subheader("🏢 Apartment Reticulation — Block → DB → Meters")
-    st.caption("Hierarchy: Apartment Block → Distribution Board → Individual meters. "
-               "Click a DB to expand its meters. Coloured by AMR status.")
+    st.subheader("🏢 Apartment Reticulation — Minisub → Bulk Meter → Distribution Boards")
+    st.caption("Block A (Helderberg) is fed from Minisub 2; Block B (Tafelberg) from Minisub 1. "
+               "Each block has a bulk check meter, feeding DB check meters, feeding apartment meters. "
+               "Click a DB to expand its meters.")
 
     aprt_hier = load_aprt_reticulation(data_path, mtime)
 
     if not aprt_hier:
-        st.warning("No apartment electrical data found. Check 'Aprt Elec' sheet.")
+        st.warning("No apartment electrical data found. Check the 'Aprt Elec' sheet.")
     else:
-        # Build AMR status lookup from current readings
-        amr_status_lookup = {}
-        if "amr_readings" in st.session_state:
-            _rdgs = st.session_state.get("amr_readings", {})
-        else:
-            _rdgs = {}
-
-        # KPIs
-        total_aprt_meters = sum(db["total"] for block in aprt_hier.values()
-                                for db in block.values())
-        total_aprt_amr    = sum(db["amr_count"] for block in aprt_hier.values()
-                                for db in block.values())
+        total_aprt_meters = sum(sum(d["total"] for d in e["dbs"].values()) for e in aprt_hier.values())
+        total_aprt_amr    = sum(sum(d["amr_count"] for d in e["dbs"].values()) for e in aprt_hier.values())
         ak1, ak2, ak3 = st.columns(3)
         ak1.metric("Total apartment meters", total_aprt_meters)
         ak2.metric("AMR commissioned",       total_aprt_amr)
         ak3.metric("Blocks",                 len(aprt_hier))
-
         st.divider()
 
-        # Build JSON for the HTML diagram
-        import json
+        import json as _json_ar
+        BLOCK_LABEL_AR = {"Block A": "Helderberg Suites", "Block B": "Tafelberg Suites"}
         aprt_diagram = []
         for block_name in sorted(aprt_hier.keys()):
-            dbs = aprt_hier[block_name]
+            e = aprt_hier[block_name]
             db_list = []
-            for db_name in sorted(dbs.keys()):
-                db = dbs[db_name]
+            for db_name in sorted(e["dbs"].keys()):
+                d = e["dbs"][db_name]
                 db_list.append({
                     "db": db_name,
-                    "parent_meter": db["parent_meter"],
-                    "total": db["total"],
-                    "amr_count": db["amr_count"],
-                    "meters": db["meters"],
-                    "serials": db["serials"],
-                    "amr_meters": db["amr_meters"],
+                    "check_serial": d["check_serial"],
+                    "check_amr": d["check_amr"],
+                    "total": d["total"], "amr_count": d["amr_count"],
+                    "meters": d["meters"], "serials": d["serials"],
+                    "amr_meters": d["amr_meters"],
                 })
-            aprt_diagram.append({"block": block_name, "dbs": db_list})
-
-        diagram_json = json.dumps(aprt_diagram)
+            aprt_diagram.append({
+                "block": block_name.strip(),
+                "label": BLOCK_LABEL_AR.get(block_name.strip(), ""),
+                "minisub": e["minisub"] or {"name": "?", "serial": ""},
+                "bulk": e["bulk"] or {"stand": "Bulk", "serial": "", "amr": False},
+                "checks_extra": [
+                    {"name": n, "serial": c["serial"], "amr": c["amr"]}
+                    for n, c in sorted(e["checks"].items()) if n not in e["dbs"]
+                ],
+                "dbs": db_list,
+            })
+        diagram_json = _json_ar.dumps(aprt_diagram)
 
         html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
 body{{font-family:'IBM Plex Mono','Courier New',monospace;background:#0e1117;color:#e0e0e0;padding:12px;}}
-.blocks-row{{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start;justify-content:center;}}
-.block-col{{display:flex;flex-direction:column;align-items:center;min-width:200px;max-width:280px;flex:1;}}
-.block-box{{background:#1F3F66;border:2px solid #5B86B3;border-radius:10px;padding:10px 16px;
-           text-align:center;width:100%;margin-bottom:8px;}}
-.block-title{{font-size:14px;font-weight:700;color:#fff;}}
-.block-sub{{font-size:10px;color:#7A96B2;margin-top:3px;}}
-.vline{{width:3px;height:16px;background:#5B86B3;}}
-.db-list{{width:100%;display:flex;flex-direction:column;gap:0;}}
-.db-drop{{width:3px;height:14px;background:#5B86B3;margin:0 auto;}}
+.blocks-row{{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start;justify-content:center;}}
+.block-col{{display:flex;flex-direction:column;align-items:center;min-width:230px;max-width:300px;flex:1;}}
+.ms-box{{background:#0f2440;border:2px solid #2E5F8A;border-radius:10px;padding:9px 16px;
+        text-align:center;width:100%;}}
+.ms-title{{font-size:13px;font-weight:700;color:#7FB3E0;}}
+.ms-sub{{font-size:9px;color:#5B86B3;font-family:monospace;margin-top:2px;}}
+.bulk-box{{background:#1a1530;border:2px solid #8B5CF6;border-radius:10px;padding:9px 16px;
+          text-align:center;width:100%;}}
+.bulk-title{{font-size:13px;font-weight:700;color:#A78BFA;}}
+.bulk-sub{{font-size:9px;color:#8B5CF6;font-family:monospace;margin-top:2px;}}
+.vline{{width:3px;height:18px;background:#5B86B3;}}
+.vline.purple{{background:#8B5CF6;}}
+.db-list{{width:100%;display:flex;flex-direction:column;}}
+.db-drop{{width:3px;height:12px;background:#8B5CF6;margin:0 auto;}}
 .db-node{{width:100%;background:#131c2b;border:1.5px solid #334d6e;border-radius:7px;
-          cursor:pointer;padding:7px 10px;transition:border-color .15s,background .15s;}}
-.db-node:hover{{border-color:#5B86B3;background:#1a2840;}}
+          cursor:pointer;padding:7px 10px;transition:border-color .15s;}}
+.db-node:hover{{border-color:#8B5CF6;}}
 .db-node.expanded{{border-color:#E69138;}}
 .db-header{{display:flex;align-items:center;gap:6px;}}
-.db-name{{font-size:11px;font-weight:700;color:#c8d8eb;flex:1;}}
+.db-name{{font-size:11px;font-weight:700;color:#c8d8eb;min-width:70px;}}
+.db-serial{{font-size:8px;color:#5B86B3;font-family:monospace;}}
 .mini-bar{{flex:1;height:4px;border-radius:2px;background:#2a3f55;overflow:hidden;}}
-.mini-fill{{height:100%;border-radius:2px;}}
+.mini-fill{{height:100%;border-radius:2px;background:#8B5CF6;}}
 .db-counts{{font-size:9px;color:#7A96B2;white-space:nowrap;}}
-.chevron{{font-size:9px;color:#5B86B3;transition:transform .2s;}}
-.chevron.open{{transform:rotate(180deg);}}
-.db-detail{{display:none;background:#0d1520;border:1px solid #1e3050;
-            border-top:none;border-radius:0 0 7px 7px;padding:7px 9px;}}
+.db-detail{{display:none;background:#0d1520;border:1px solid #1e3050;border-top:none;
+            border-radius:0 0 7px 7px;padding:7px 9px;}}
 .db-detail.open{{display:block;}}
 .meter-grid{{display:flex;flex-wrap:wrap;gap:3px;margin-top:4px;}}
 .meter-chip{{padding:1px 5px;border-radius:4px;font-size:9px;font-weight:600;
-             display:inline-flex;align-items:center;gap:2px;cursor:pointer;}}
+             display:inline-flex;align-items:center;gap:2px;}}
 .chip-amr{{background:#3F7D5C22;color:#6eb88a;border:1px solid #3F7D5C55;}}
-.chip-no-amr{{background:#1F3F6622;color:#7a9ec4;border:1px solid #334d6e;}}
+.chip-no{{background:#1F3F6622;color:#7a9ec4;border:1px solid #334d6e;}}
 .dot{{display:inline-block;width:5px;height:5px;border-radius:50%;}}
-.dot-amr{{background:#3F7D5C;}}
-.dot-no{{background:#334d6e;}}
-.parent-serial{{font-size:9px;color:#5B86B3;margin-top:4px;}}
-.detail-header{{font-size:8px;color:#5B86B3;margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em;}}
+.extra-note{{font-size:8px;color:#5B86B3;margin-top:6px;}}
 </style></head><body>
 <div class="blocks-row" id="root"></div>
 <script>
 const data = {diagram_json};
 function pct(a,t){{return t>0?Math.round(a/t*100):0;}}
-function barColor(p){{return p>=100?'#3F7D5C':p>=60?'#5B86B3':p>=30?'#E69138':'#BD4B2C';}}
 
-data.forEach(block=>{{
-  const col = document.createElement('div');
-  col.className='block-col';
+data.forEach(b => {{
+  const col = document.createElement('div'); col.className='block-col';
 
-  const box = document.createElement('div');
-  box.className='block-box';
-  const p = pct(block.dbs.reduce((s,d)=>s+d.amr_count,0), block.dbs.reduce((s,d)=>s+d.total,0));
-  box.innerHTML=`<div class="block-title">${{block.block}}</div>
-    <div class="block-sub">${{block.dbs.reduce((s,d)=>s+d.total,0)}} meters · ${{p}}% AMR</div>`;
-  col.appendChild(box);
+  // Level 1 — Minisub
+  const ms = document.createElement('div'); ms.className='ms-box';
+  ms.innerHTML = `<div class="ms-title">🔌 ${{b.minisub.name}}</div>
+    <div class="ms-sub">Serial ${{b.minisub.serial}}</div>`;
+  col.appendChild(ms);
+  const v1 = document.createElement('div'); v1.className='vline'; col.appendChild(v1);
 
-  const vl=document.createElement('div'); vl.className='vline'; col.appendChild(vl);
+  // Level 2 — Block bulk meter
+  const bulk = document.createElement('div'); bulk.className='bulk-box';
+  bulk.innerHTML = `<div class="bulk-title">🏢 ${{b.block}} Bulk Meter</div>
+    <div class="bulk-sub">${{b.label}} · Serial ${{b.bulk.serial}}${{b.bulk.amr?'':' · ⚠ AMR pending'}}</div>`;
+  col.appendChild(bulk);
+  const v2 = document.createElement('div'); v2.className='vline purple'; col.appendChild(v2);
 
-  const dbList=document.createElement('div'); dbList.className='db-list';
-  block.dbs.forEach(db=>{{
+  // Level 3 — DB check meters with apartment meters below
+  const dbList = document.createElement('div'); dbList.className='db-list';
+  b.dbs.forEach(d => {{
     const drop=document.createElement('div'); drop.className='db-drop'; dbList.appendChild(drop);
     const node=document.createElement('div'); node.className='db-node';
-    const dp=pct(db.amr_count, db.total);
-    node.innerHTML=`<div class="db-header">
-      <span class="db-name">${{db.db}}</span>
-      <div class="mini-bar"><div class="mini-fill" style="width:${{dp}}%;background:${{barColor(dp)}}"></div></div>
-      <span class="db-counts">${{db.amr_count}}/${{db.total}}</span>
-      <span class="chevron" id="chev-${{db.db}}">▾</span>
-    </div>
-    ${{db.parent_meter?`<div class="parent-serial">Parent: ${{db.parent_meter}}</div>`:''}}`; 
+    const dp = pct(d.amr_count, d.total);
+    const dbId = (b.block + '-' + d.db).replace(/[^a-zA-Z0-9]/g,'');
+    node.innerHTML = `<div class="db-header">
+      <span class="db-name">${{d.db}}</span>
+      <span class="db-serial">${{d.check_serial}}</span>
+      <div class="mini-bar"><div class="mini-fill" style="width:${{dp}}%"></div></div>
+      <span class="db-counts">${{d.amr_count}}/${{d.total}}</span>
+      <span style="font-size:9px;color:#5B86B3" id="chev-${{dbId}}">▾</span>
+    </div>`;
 
-    const detail=document.createElement('div');
-    detail.className='db-detail';
-    detail.id='det-'+db.db;
-    const amrSet=new Set(db.amr_meters);
-    const chips=db.meters.map(m=>{{
-      const isAmr=amrSet.has(m);
-      const serial=(db.serials&&db.serials[m])||'';
-      return `<span class="meter-chip ${{isAmr?'chip-amr':'chip-no-amr'}}"
-        title="${{m}} · Serial: ${{serial||'—'}} · AMR: ${{isAmr?'Yes':'No'}}">
-        <span class="dot ${{isAmr?'dot-amr':'dot-no'}}"></span>${{m.split('/').pop()}}</span>`;
+    const det=document.createElement('div'); det.className='db-detail'; det.id='det-'+dbId;
+    const amrSet=new Set(d.amr_meters);
+    const chips=d.meters.map(m => {{
+      const ok=amrSet.has(m); const serial=(d.serials&&d.serials[m])||'';
+      return `<span class="meter-chip ${{ok?'chip-amr':'chip-no'}}"
+        title="${{m}} · Serial ${{serial||'—'}} · AMR ${{ok?'✓':'pending'}}">
+        <span class="dot" style="background:${{ok?'#3F7D5C':'#334d6e'}}"></span>${{m.split('/').pop()}}</span>`;
     }}).join('');
-    detail.innerHTML=`<div class="detail-header">${{db.total}} meters · ${{db.amr_count}} AMR</div>
+    det.innerHTML = `<div style="font-size:8px;color:#8B5CF6;margin-bottom:3px">
+      CHECK METER ${{d.check_serial}} → ${{d.total}} apartment meters (${{d.amr_count}} AMR)</div>
       <div class="meter-grid">${{chips}}</div>`;
 
-    node.addEventListener('click',()=>{{
-      const d=document.getElementById('det-'+db.db);
-      const c=document.getElementById('chev-'+db.db);
-      const open=d.classList.toggle('open');
-      node.classList.toggle('expanded',open);
-      if(c)c.classList.toggle('open',open);
+    node.addEventListener('click', () => {{
+      const open = det.classList.toggle('open');
+      node.classList.toggle('expanded', open);
     }});
-    dbList.appendChild(node);
-    dbList.appendChild(detail);
+    dbList.appendChild(node); dbList.appendChild(det);
   }});
   col.appendChild(dbList);
+
+  if (b.checks_extra && b.checks_extra.length) {{
+    const extra = document.createElement('div'); extra.className='extra-note';
+    extra.innerHTML = 'Other check meters: ' + b.checks_extra.map(c =>
+      `${{c.name}} (${{c.serial}})`).join(' · ');
+    col.appendChild(extra);
+  }}
+
   document.getElementById('root').appendChild(col);
 }});
 </script></body></html>"""
-        components.html(html, height=750, scrolling=True)
+        components.html(html, height=900, scrolling=True)
 
 # =====================================================================
 # APARTMENT INSTALLED TAB (when in apartment mode)
@@ -3275,17 +3365,171 @@ if is_apartments:
 
 
 # =====================================================================
-# APARTMENT FLOOR PLAN TAB — schematic per PDF layouts, AMR colour-coded
+# BALANCING TAB — parent vs children consumption with losses
+# =====================================================================
+with tab_balance:
+    st.subheader("⚖️ Consumption Balancing — Electrical (kWh)")
+    st.caption(
+        "Compares each parent check meter's consumption against the sum of its children over the "
+        "selected window. Meters without readings in the window are counted toward the unexplained "
+        "difference (losses) until their readings import."
+    )
+
+    bal_period = st.radio("Period", ["Last 24h", "Last 3 days", "Last 7 days", "Last 30 days"],
+                          horizontal=True, key="bal_period")
+    _hours = {"Last 24h": 24, "Last 3 days": 72, "Last 7 days": 168, "Last 30 days": 720}[bal_period]
+    _end   = datetime.now()
+    _start = _end - timedelta(hours=_hours)
+    cons = db_get_consumption(_start.isoformat(), _end.isoformat())
+
+    if not cons:
+        st.info("No consumption data in the selected window yet — the history DB fills up as hourly readings import.")
+    else:
+        st.caption(f"Window: {_start.strftime('%d %b %H:%M')} → {_end.strftime('%d %b %H:%M')} · "
+                   f"**{len(cons)}** serials with usable readings")
+
+        def _delta(serial):
+            c = cons.get(str(serial).strip())
+            return c["delta"] if c else None
+
+        def _bal_row(label, parent_serial, child_sum, child_missing, indent=0):
+            """Render one balancing line: parent vs children with loss."""
+            pad = "&nbsp;" * (indent * 6)
+            p = _delta(parent_serial)
+            cols = st.columns([2.4, 1.2, 1.2, 1.2, 2])
+            cols[0].markdown(f"{pad}**{label}**", unsafe_allow_html=True)
+            cols[1].markdown(f"Parent: **{p:,.1f}** kWh" if p is not None else "Parent: *no reading*")
+            cols[2].markdown(f"Children: **{child_sum:,.1f}** kWh")
+            if p is not None:
+                loss = p - child_sum
+                pctl = (loss / p * 100) if p > 0 else 0
+                colr = "#BD4B2C" if pctl > 10 else "#E69138" if pctl > 3 else "#2E7D52"
+                cols[3].markdown(
+                    f"<span style='color:{colr};font-weight:700'>{loss:+,.1f} kWh ({pctl:+.1f}%)</span>",
+                    unsafe_allow_html=True)
+            else:
+                cols[3].markdown("Loss: *n/a*")
+            note = f"{child_missing} child meter(s) without readings" if child_missing else ""
+            cols[4].caption(note)
+
+        # ── Load hierarchies ────────────────────────────────────────────
+        fs_hier   = load_kiosk_data(data_path, mtime)
+        aprt_hier = load_aprt_reticulation(data_path, mtime)
+
+        # FS elec serials per kiosk (freestanding data regardless of current view)
+        fs_df = load_data(data_path, mtime, "freestanding")
+        fs_elec = fs_df[fs_df["meter_type"] == "Electrical"]
+
+        # kiosk → stand serials from FS Elec sheet
+        try:
+            _xk = pd.ExcelFile(data_path)
+            _en = find_sheet(_xk, ELEC_SHEET_CANDIDATES)
+            _ek = _xk.parse(_en)
+            _ek.columns = [str(c).strip() for c in _ek.columns]
+            _ek["kiosk"]  = _ek["Kiosk Number"].astype(str).str.strip()
+            _ek["ser"]    = _ek["Meter Serial"].apply(
+                lambda v: str(int(float(v))) if pd.notna(v) and str(v) not in ("nan","") else "")
+            kiosk_serials = _ek[_ek["ser"] != ""].groupby("kiosk")["ser"].apply(list).to_dict()
+            kiosk_all_counts = _ek.groupby("kiosk")["Stand Number"].count().to_dict()
+        except Exception:
+            kiosk_serials, kiosk_all_counts = {}, {}
+
+        MS_TO_BLOCK = {}
+        for _bn, _be in (aprt_hier or {}).items():
+            if _be.get("minisub"):
+                MS_TO_BLOCK[str(_be["minisub"]["name"]).upper()] = _bn
+
+        # ── Level 1: Minisubs ──────────────────────────────────────────
+        st.markdown("#### Level 1 — Minisubs")
+        for ms_id in sorted(fs_hier.keys()):
+            ms = fs_hier[ms_id]
+            ms_serial = str(ms["serial"]).strip()
+            kiosk_sum, kiosk_missing, kiosk_details = 0.0, 0, []
+            for k in ms["kiosks"]:
+                serials = kiosk_serials.get(k["kiosk"], [])
+                deltas  = [_delta(s) for s in serials]
+                have    = [d for d in deltas if d is not None]
+                ksum    = sum(have)
+                kmiss   = (kiosk_all_counts.get(k["kiosk"], len(serials))) - len(have)
+                kiosk_sum += ksum
+                kiosk_missing += max(kmiss, 0)
+                kiosk_details.append((k["kiosk"], ksum, len(have), max(kmiss, 0)))
+
+            # Apartment bulk under this minisub?
+            blk = MS_TO_BLOCK.get(f"MS{int(float(ms_id))}" if str(ms_id).replace('.','').isdigit() else str(ms_id).upper())
+            bulk_delta = None
+            bulk_label = ""
+            if blk and aprt_hier[blk].get("bulk"):
+                bs = aprt_hier[blk]["bulk"]["serial"]
+                bulk_delta = _delta(bs)
+                bulk_label = f"{blk} Bulk ({bs})"
+
+            children_total = kiosk_sum + (bulk_delta or 0)
+            miss_total = kiosk_missing + (1 if (blk and bulk_delta is None) else 0)
+
+            with st.expander(f"🔌 Minisub {ms_id} · serial {ms_serial}", expanded=False):
+                _bal_row(f"MS{ms_id} vs all children", ms_serial, children_total, miss_total)
+                st.markdown("---")
+                st.markdown("**Kiosks** (sum of stand meters per kiosk)")
+                for kname, ksum, khave, kmiss in kiosk_details:
+                    kc = st.columns([2, 1.4, 2])
+                    kc[0].caption(f"⚡ {kname}")
+                    kc[1].caption(f"{ksum:,.1f} kWh · {khave} meters")
+                    kc[2].caption(f"{kmiss} without readings" if kmiss else "")
+                if bulk_label:
+                    bc = st.columns([2, 1.4, 2])
+                    bc[0].caption(f"🏢 {bulk_label}")
+                    bc[1].caption(f"{bulk_delta:,.1f} kWh" if bulk_delta is not None else "no reading")
+                    bc[2].caption("" if bulk_delta is not None else "counted in losses")
+
+        # ── Level 2 & 3: Apartment blocks ──────────────────────────────
+        st.markdown("#### Levels 2–3 — Apartment blocks")
+        for blk in sorted((aprt_hier or {}).keys()):
+            e = aprt_hier[blk]
+            if not e.get("bulk"):
+                continue
+            bulk_serial = e["bulk"]["serial"]
+
+            # Level 2: bulk vs sum of DB check meters
+            check_deltas, check_missing = [], 0
+            for dbn, d in e["dbs"].items():
+                cd = _delta(d["check_serial"])
+                if cd is None:
+                    check_missing += 1
+                else:
+                    check_deltas.append(cd)
+            with st.expander(f"🏢 {blk} · bulk {bulk_serial}", expanded=False):
+                _bal_row(f"{blk} Bulk vs DB check meters", bulk_serial,
+                         sum(check_deltas), check_missing)
+                st.markdown("---")
+                st.markdown("**Per-DB: check meter vs apartment meters**")
+                for dbn in sorted(e["dbs"].keys()):
+                    d = e["dbs"][dbn]
+                    apt_deltas = [_delta(s) for s in d["serials"].values()]
+                    apt_have   = [x for x in apt_deltas if x is not None]
+                    apt_miss   = len(apt_deltas) - len(apt_have)
+                    _bal_row(f"{dbn} ({d['check_serial']})", d["check_serial"],
+                             sum(apt_have), apt_miss, indent=1)
+
+        st.caption(
+            "Consumption = last reading − first reading per serial within the window. "
+            "A negative difference usually means some children lack readings for part of the window. "
+            "Minisub and bulk check meters that aren't yet on AMR show as 'no reading' — "
+            "balancing at that level becomes available once they import."
+        )
+
+# =====================================================================
+# APARTMENT FLOOR PLAN TAB — clickable schematic + AMR history
 # =====================================================================
 if is_apartments and tab_floorplan is not None:
  with tab_floorplan:
     st.subheader("🏬 Block Floor Plans — AMR Import Status")
     st.caption(
-        "Schematic layout per the architectural drawings: odd units north side, even units south, "
-        "three wings per floor. Colours use the same AMR import scheme as the AMR Live tab."
+        "Schematic per the architectural drawings: odd units north side, even south, three wings per "
+        "floor. Same AMR colour scheme as AMR Live. **Click any unit to open its usage graphs below.**"
     )
 
-    # ── Load current AMR readings (cache → DB fallback) ───────────────
+    # Current AMR readings: cache → DB fallback
     _fp_readings = {}
     _cached = load_amr_cache()
     if _cached and _cached.get("readings"):
@@ -3293,24 +3537,20 @@ if is_apartments and tab_floorplan is not None:
     if not _fp_readings:
         _fp_readings = load_latest_from_db()
 
-    # ── Meter type selector ────────────────────────────────────────────
-    fp_type = st.radio(
-        "Meter type", ["Electrical", "Water (Cold)", "Water (Hot)"],
-        horizontal=True, key="fp_meter_type"
-    )
+    fp_type = st.radio("Colour by meter type", ["Electrical", "Water (Cold)", "Water (Hot)"],
+                       horizontal=True, key="fp_meter_type")
 
-    # serial lookup for the chosen type: stand → serial
     _fp_df = df[df["meter_type"] == fp_type]
-    serial_by_stand = dict(zip(_fp_df["stand"], _fp_df["serial"]))
+    serial_by_stand   = dict(zip(_fp_df["stand"], _fp_df["serial"]))
     amr_flag_by_stand = dict(zip(_fp_df["stand"], _fp_df["amr"]))
 
     import re as _re_fp
     import json as _json_fp
+    from urllib.parse import quote as _q
 
     BLOCK_NAMES = {"A": "Block A · Helderberg Suites", "B": "Block B · Tafelberg Suites"}
     FLOOR_LABEL = {"00": "Ground Floor", "01": "First Floor", "02": "Second Floor"}
 
-    # Build per-block, per-floor unit structures
     blocks_fp = {}
     for stand in df["stand"].unique():
         m = _re_fp.match(r"Aprt BL ([AB])/(\d+)/(\d+)", str(stand))
@@ -3323,58 +3563,50 @@ if is_apartments and tab_floorplan is not None:
         rd_iso  = reading.get("reading_date") if reading else None
         label, color, badge = amr_status_info(rd_iso)
         if not amr_fitted:
-            color, label, badge = "#33415c", "AMR not fitted", "amr-nofit"
-        last_val = reading.get("reading_value") if reading else None
+            color, label = "#33415c", "AMR not fitted"
         blocks_fp.setdefault(blk, {}).setdefault(floor, []).append({
-            "unit": unit,
-            "unit_str": m.group(3),
-            "stand": stand,
-            "serial": serial,
-            "color": color,
-            "label": label,
-            "value": last_val,
+            "unit": unit, "unit_str": m.group(3), "stand": stand,
+            "stand_url": _q(stand, safe=""),
+            "serial": serial, "color": color, "label": label,
+            "value": reading.get("reading_value") if reading else None,
             "low_bat": int(reading.get("low_battery", 0)) if reading else 0,
         })
 
     fp_json = _json_fp.dumps({
         "blocks": [
-            {
-                "id": blk,
-                "name": BLOCK_NAMES.get(blk, f"Block {blk}"),
-                "floors": [
-                    {
-                        "id": fl,
-                        "label": FLOOR_LABEL.get(fl, fl),
-                        "units": sorted(blocks_fp[blk][fl], key=lambda u: u["unit"]),
-                    }
-                    for fl in sorted(blocks_fp[blk].keys(), reverse=True)  # Second → Ground, top-down like a building
-                ],
-            }
+            {"id": blk, "name": BLOCK_NAMES.get(blk, f"Block {blk}"),
+             "floors": [
+                 {"id": fl, "label": FLOOR_LABEL.get(fl, fl),
+                  "units": sorted(blocks_fp[blk][fl], key=lambda u: u["unit"])}
+                 for fl in sorted(blocks_fp[blk].keys(), reverse=True)
+             ]}
             for blk in sorted(blocks_fp.keys())
         ],
-        "unit_suffix": fp_type,
+        "meter_type": fp_type,
     })
 
     fp_html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
 body{{font-family:'IBM Plex Mono','Courier New',monospace;background:#0e1117;color:#e0e0e0;padding:10px;}}
-.block-wrap{{margin-bottom:34px;}}
+.block-wrap{{margin-bottom:30px;}}
 .block-title{{font-size:15px;font-weight:700;color:#c8d8eb;margin-bottom:2px;}}
-.block-sub{{font-size:10px;color:#5B86B3;margin-bottom:12px;}}
-.floor{{margin-bottom:16px;}}
-.floor-label{{font-size:10px;color:#7A96B2;text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px;}}
+.block-sub{{font-size:10px;color:#5B86B3;margin-bottom:10px;}}
+.floor{{margin-bottom:14px;}}
+.floor-label{{font-size:10px;color:#7A96B2;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;}}
 .floor-body{{background:#131c2b;border:1.5px solid #26364d;border-radius:8px;padding:8px 10px;}}
 .row{{display:flex;gap:3px;align-items:center;margin:2px 0;}}
-.row-label{{font-size:8px;color:#44586f;width:34px;flex-shrink:0;}}
-.wing-gap{{width:22px;flex-shrink:0;display:flex;align-items:center;justify-content:center;}}
-.wing-gap::after{{content:'';width:2px;height:20px;background:#26364d;border-radius:1px;}}
-.unit{{width:34px;height:24px;border-radius:4px;display:flex;align-items:center;justify-content:center;
-       font-size:8.5px;font-weight:700;color:#fff;cursor:default;position:relative;
-       text-shadow:0 0 3px rgba(0,0,0,.7);flex-shrink:0;}}
-.unit.lowbat{{outline:2px dashed #FFF176;outline-offset:-2px;}}
-.unit:hover .tip{{display:block;}}
-.tip{{display:none;position:absolute;bottom:110%;left:50%;transform:translateX(-50%);
+.row-label{{font-size:8px;color:#44586f;width:32px;flex-shrink:0;}}
+.wing-gap{{width:20px;flex-shrink:0;display:flex;align-items:center;justify-content:center;}}
+.wing-gap::after{{content:'';width:2px;height:20px;background:#26364d;}}
+a.unit{{width:34px;height:24px;border-radius:4px;display:flex;align-items:center;justify-content:center;
+       font-size:8.5px;font-weight:700;color:#fff;cursor:pointer;position:relative;
+       text-shadow:0 0 3px rgba(0,0,0,.7);flex-shrink:0;text-decoration:none;
+       transition:transform .08s;}}
+a.unit:hover{{transform:scale(1.18);z-index:5;outline:1.5px solid #fff;}}
+a.unit.lowbat{{outline:2px dashed #FFF176;outline-offset:-2px;}}
+a.unit:hover .tip{{display:block;}}
+.tip{{display:none;position:absolute;bottom:112%;left:50%;transform:translateX(-50%);
      background:#0a0f18;border:1px solid #3a4f6a;border-radius:6px;padding:6px 9px;
      font-size:9px;font-weight:400;color:#c8d8eb;white-space:nowrap;z-index:50;
      box-shadow:0 4px 14px rgba(0,0,0,.6);text-shadow:none;}}
@@ -3382,83 +3614,91 @@ body{{font-family:'IBM Plex Mono','Courier New',monospace;background:#0e1117;col
 .passage-line{{flex:1;border-top:1px dashed #33415c;position:relative;}}
 .passage-text{{position:absolute;top:-6px;left:50%;transform:translateX(-50%);
               font-size:7px;color:#44586f;background:#131c2b;padding:0 6px;letter-spacing:.15em;}}
-.legend{{display:flex;flex-wrap:wrap;gap:14px;font-size:10px;margin-top:6px;padding:8px 2px;}}
-.lg-item{{display:flex;align-items:center;gap:4px;}}
-.lg-swatch{{width:12px;height:12px;border-radius:3px;display:inline-block;}}
+.legend{{display:flex;flex-wrap:wrap;gap:14px;font-size:10px;margin-top:6px;padding:6px 2px;}}
+.lg{{display:flex;align-items:center;gap:4px;}}
+.sw{{width:12px;height:12px;border-radius:3px;display:inline-block;}}
 </style></head><body>
 <div id="root"></div>
 <div class="legend">
-  <span class="lg-item"><span class="lg-swatch" style="background:#2E7D52"></span>Imported &lt;24h</span>
-  <span class="lg-item"><span class="lg-swatch" style="background:#D4AC0D"></span>1–3 days</span>
-  <span class="lg-item"><span class="lg-swatch" style="background:#E67E22"></span>4–7 days</span>
-  <span class="lg-item"><span class="lg-swatch" style="background:#BD4B2C"></span>7+ days</span>
-  <span class="lg-item"><span class="lg-swatch" style="background:#607080"></span>AMR fitted, never seen</span>
-  <span class="lg-item"><span class="lg-swatch" style="background:#33415c"></span>AMR not fitted</span>
-  <span class="lg-item"><span class="lg-swatch" style="outline:2px dashed #FFF176;outline-offset:-2px;background:transparent"></span>Low battery</span>
+  <span class="lg"><span class="sw" style="background:#2E7D52"></span>&lt;24h</span>
+  <span class="lg"><span class="sw" style="background:#D4AC0D"></span>1–3d</span>
+  <span class="lg"><span class="sw" style="background:#E67E22"></span>4–7d</span>
+  <span class="lg"><span class="sw" style="background:#BD4B2C"></span>7d+</span>
+  <span class="lg"><span class="sw" style="background:#607080"></span>AMR fitted, never seen</span>
+  <span class="lg"><span class="sw" style="background:#33415c"></span>AMR not fitted</span>
+  <span class="lg"><span class="sw" style="outline:2px dashed #FFF176;outline-offset:-2px"></span>Low battery</span>
+  <span class="lg" style="color:#7A96B2">· Click a unit for its usage graphs</span>
 </div>
 <script>
 const data = {fp_json};
 const root = document.getElementById('root');
-
-// wings: units 1-14 | 15-28 | 29-42
 function wingOf(u){{ const n = u % 100; return n <= 14 ? 0 : n <= 28 ? 1 : 2; }}
 
 data.blocks.forEach(block => {{
-  const bw = document.createElement('div');
-  bw.className = 'block-wrap';
+  const bw = document.createElement('div'); bw.className = 'block-wrap';
   bw.innerHTML = `<div class="block-title">🏢 ${{block.name}}</div>
-    <div class="block-sub">${{data.unit_suffix}} meters · hover a unit for serial &amp; last import</div>`;
+    <div class="block-sub">${{data.meter_type}} meters · click a unit to open its graphs</div>`;
 
   block.floors.forEach(floor => {{
-    const f = document.createElement('div');
-    f.className = 'floor';
+    const f = document.createElement('div'); f.className = 'floor';
     f.innerHTML = `<div class="floor-label">${{floor.label}}</div>`;
-    const body = document.createElement('div');
-    body.className = 'floor-body';
-
+    const body = document.createElement('div'); body.className = 'floor-body';
     const odd  = floor.units.filter(u => u.unit % 2 === 1);
     const even = floor.units.filter(u => u.unit % 2 === 0);
 
-    function buildRow(units, labelTxt) {{
-      const row = document.createElement('div');
-      row.className = 'row';
-      const lbl = document.createElement('span');
-      lbl.className = 'row-label';
-      lbl.textContent = labelTxt;
-      row.appendChild(lbl);
+    function buildRow(units, lblTxt) {{
+      const row = document.createElement('div'); row.className = 'row';
+      const lbl = document.createElement('span'); lbl.className = 'row-label';
+      lbl.textContent = lblTxt; row.appendChild(lbl);
       let lastWing = -1;
       units.forEach(u => {{
         const w = wingOf(u.unit);
         if (lastWing !== -1 && w !== lastWing) {{
-          const gap = document.createElement('span');
-          gap.className = 'wing-gap';
+          const gap = document.createElement('span'); gap.className = 'wing-gap';
           row.appendChild(gap);
         }}
         lastWing = w;
-        const cell = document.createElement('span');
+        const cell = document.createElement('a');
         cell.className = 'unit' + (u.low_bat ? ' lowbat' : '');
         cell.style.background = u.color;
+        cell.href = '?sel_stand=' + u.stand_url + '&view=apartments';
+        cell.target = '_parent';
         cell.innerHTML = `${{u.unit_str}}<span class="tip">
           <b>${{u.stand}}</b><br>Serial: ${{u.serial || '—'}}<br>${{u.label}}
           ${{u.value !== null && u.value !== undefined ? '<br>Reading: ' + u.value : ''}}
-          ${{u.low_bat ? '<br>🔋 Low battery' : ''}}</span>`;
+          ${{u.low_bat ? '<br>🔋 Low battery' : ''}}<br><i>Click for graphs ↓</i></span>`;
         row.appendChild(cell);
       }});
       return row;
     }}
 
     body.appendChild(buildRow(odd, 'ODD'));
-    const pass = document.createElement('div');
-    pass.className = 'passage';
+    const pass = document.createElement('div'); pass.className = 'passage';
     pass.innerHTML = '<div class="passage-line"><span class="passage-text">PASSAGE</span></div>';
     body.appendChild(pass);
     body.appendChild(buildRow(even, 'EVEN'));
-
-    f.appendChild(body);
-    bw.appendChild(f);
+    f.appendChild(body); bw.appendChild(f);
   }});
   root.appendChild(bw);
 }});
 </script></body></html>"""
+    components.html(fp_html, height=980, scrolling=True)
 
-    components.html(fp_html, height=1050, scrolling=True)
+    st.divider()
+
+    # ── History panel: clicked unit or manual search ───────────────────
+    st.markdown("##### 📈 Unit history — electricity, cold & hot water")
+    all_stands_fp = sorted(df["stand"].unique().tolist())
+    _default_fp = st.session_state.get("fp_selected_stand")
+    if _default_fp not in all_stands_fp:
+        _default_fp = all_stands_fp[0] if all_stands_fp else None
+
+    sel_fp = st.selectbox(
+        "Unit (auto-selected when you click the floor plan)",
+        options=all_stands_fp,
+        index=all_stands_fp.index(_default_fp) if _default_fp in all_stands_fp else 0,
+        key="fp_stand_select",
+    )
+    if sel_fp:
+        st.session_state["fp_selected_stand"] = sel_fp
+        render_stand_history(sel_fp, df, key_prefix="fp")
