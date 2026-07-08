@@ -222,13 +222,13 @@ def save_amr_cache(data):
 def amr_status_info(reading_date_iso):
     """
     Return (label, color_hex, badge_class) based on hours since last reading.
-    None reading_date → never seen.
+    Handles None, NaN, empty string, and non-ISO strings gracefully.
     """
-    if not reading_date_iso:
+    if not reading_date_iso or str(reading_date_iso) in ("nan", "None", "NaT", ""):
         return "No reading", "#607080", "amr-never"
     try:
-        dt = datetime.fromisoformat(reading_date_iso)
-    except ValueError:
+        dt = datetime.fromisoformat(str(reading_date_iso))
+    except (ValueError, TypeError):
         return "No reading", "#607080", "amr-never"
     hours_ago = (datetime.now() - dt).total_seconds() / 3600
     if hours_ago <= 24:
@@ -2177,7 +2177,7 @@ with tab_amr:
                 "Unit type":    r["unit_type"],
                 "Section":      r["wbho_section"],
                 "Serial":       r["serial"],
-                "Last reading": r["last_reading"][:16].replace("T", " ") if r["last_reading"] else "—",
+                "Last reading": str(r["last_reading"])[:16].replace("T", " ") if r["last_reading"] and str(r["last_reading"]) not in ("nan", "None", "") else "—",
                 "Reading":      fmt_reading(r["reading_value"], r["meter_type"]),
                 "Status":       r["status_label"],
                 "Low battery":  "🔋" if r["low_battery"] else "",
