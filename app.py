@@ -23,6 +23,38 @@ st.set_page_config(
     layout="wide",
 )
 
+# ---------- Mobile detection ----------
+def _detect_mobile():
+    """Best-effort mobile detection from the browser User-Agent."""
+    try:
+        ua = st.context.headers.get("User-Agent", "")
+        return bool(re.search(r"Mobi|Android|iPhone|iPad", ua, re.IGNORECASE))
+    except Exception:
+        return False
+
+if "is_mobile" not in st.session_state:
+    st.session_state["is_mobile"] = _detect_mobile()
+IS_MOBILE = st.session_state["is_mobile"]
+
+
+def metric_row(items, desktop_cols=None):
+    """
+    Render a row of st.metric tiles that adapts to screen size:
+    all in one row on desktop, chunked 2-per-row on mobile.
+    items: list of tuples (label, value) or (label, value, delta) or
+           (label, value, delta, delta_color).
+    """
+    per_row = 2 if IS_MOBILE else (desktop_cols or len(items))
+    for i in range(0, len(items), per_row):
+        chunk = items[i:i + per_row]
+        cols = st.columns(per_row)
+        for col, item in zip(cols, chunk):
+            label, value = item[0], item[1]
+            delta = item[2] if len(item) > 2 else None
+            dcol  = item[3] if len(item) > 3 else "normal"
+            col.metric(label, value, delta, delta_color=dcol)
+
+
 # ---------- Styling ----------
 st.markdown("""
 <style>
@@ -50,6 +82,31 @@ div[data-testid="stMetricDelta"], div[data-testid="stMetricDelta"] * {
   fill: #3F7D5C !important;
 }
 h1, h2, h3 {color: #152B45;}
+
+/* ── Mobile responsiveness ─────────────────────────────────────── */
+@media (max-width: 740px) {
+  .block-container {padding: 0.6rem 0.7rem 2rem 0.7rem !important;}
+  h1 {font-size: 1.35rem !important;}
+  h2 {font-size: 1.1rem !important;}
+  h3 {font-size: 1.0rem !important;}
+  div[data-testid="stMetric"] {padding: 6px 8px !important;}
+  div[data-testid="stMetricValue"], div[data-testid="stMetricValue"] * {
+    font-size: 1.15rem !important;
+  }
+  div[data-testid="stMetricLabel"], div[data-testid="stMetricLabel"] * {
+    font-size: 10px !important;
+  }
+  /* keep tab bar on one scrollable line */
+  div[data-testid="stTabs"] button {padding: 6px 8px !important; font-size: 12px !important;}
+  div[role="tablist"] {overflow-x: auto !important; flex-wrap: nowrap !important;}
+  /* header logos smaller */
+  .app-header-logo img {max-height: 46px !important;}
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
 .badge {display:inline-block; padding:2px 9px; border-radius:14px; font-size:11px; font-weight:600; font-family: monospace;}
 .badge-overdue {background:#F5E2DB; color:#BD4B2C;}
 .badge-upcoming {background:#FCEFDD; color:#B96E1E;}
@@ -1602,8 +1659,34 @@ def summary_counters(view_df, full_df, label):
 
 
 # ---------- Site selector ----------
-st.title("🔧 Sitari Evergreen — Meter Commissioning")
-st.caption("Erf 1186 Sitari · Lifestyle Retirement Village")
+_ASSETS = os.path.join(os.path.dirname(__file__), "assets")
+_EVG_LOGO = os.path.join(_ASSETS, "evergreen_sitari_logo.png")
+_VOL_LOGO = os.path.join(_ASSETS, "voltano_metering_logo.png")
+
+# Voltano logo pinned in the Streamlit header (top-left)
+if os.path.exists(_VOL_LOGO):
+    try:
+        st.logo(_VOL_LOGO, size="large")
+    except Exception:
+        pass
+
+if IS_MOBILE:
+    # Compact stacked header for phones
+    if os.path.exists(_EVG_LOGO):
+        st.image(_EVG_LOGO, width=210)
+    st.markdown("### 🔧 Sitari Evergreen — Meter Commissioning")
+    st.caption("Erf 1186 Sitari · Lifestyle Retirement Village · managed by **Voltano Metering**")
+else:
+    hc1, hc2, hc3 = st.columns([1.3, 3, 1.3])
+    with hc1:
+        if os.path.exists(_EVG_LOGO):
+            st.image(_EVG_LOGO, use_container_width=True)
+    with hc2:
+        st.title("🔧 Sitari Evergreen — Meter Commissioning")
+        st.caption("Erf 1186 Sitari · Lifestyle Retirement Village · managed by **Voltano Metering**")
+    with hc3:
+        if os.path.exists(_VOL_LOGO):
+            st.image(_VOL_LOGO, use_container_width=True)
 
 # Handle stand-click links from the apartment floor plan (query params).
 # Must run BEFORE the radio is instantiated so we can steer it to Apartments.
@@ -1621,6 +1704,9 @@ with col_switch:
         horizontal=True, key="site_type",
         label_visibility="collapsed"
     )
+with col_title:
+    st.toggle("📱 Compact mobile layout", key="is_mobile",
+              help="Auto-detected from your device — flip manually if the layout looks off.")
 site_key = "freestanding" if "Freestanding" in site_type else "apartments"
 is_apartments = site_key == "apartments"
 
@@ -1650,22 +1736,23 @@ due_soon_n    = int((df["status"] == "Due soon").sum())
 outstanding_n = total - installed_n
 
 if is_apartments:
-    ca1, ca2, ca3, ca4 = st.columns(4)
-    ca1.metric("Total meter points", total)
-    ca2.metric("Installed (serial present)", installed_n, f"{round(installed_n/total*100) if total else 0}% complete")
-    ca3.metric("AMR commissioned", int(df["amr"].sum()) if "amr" in df.columns else 0)
-    water_types = df[df["meter_type"].str.startswith("Water")]["meter_type"].nunique()
-    ca4.metric("Meter types", f"Elec · Cold · Hot")
+    metric_row([
+        ("Total meter points", total),
+        ("Installed (serial present)", installed_n, f"{round(installed_n/total*100) if total else 0}% complete"),
+        ("AMR commissioned", int(df["amr"].sum()) if "amr" in df.columns else 0),
+        ("Meter types", "Elec · Cold · Hot"),
+    ])
 else:
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Total meter points", total)
-    c2.metric("Installed", installed_n, f"{round(installed_n/total*100) if total else 0}% complete")
-    c3.metric("Outstanding", outstanding_n)
-    c4.metric("Due within 14 days", due_soon_n)
-    c5.metric("Overdue", overdue_n, delta_color="inverse")
     faulty_n         = int(df["faulty"].sum()) if "faulty" in df.columns else 0
     faulty_pending_n = int(df[df["faulty"] & ~df["faulty_replaced"]]["stand"].count()) if "faulty" in df.columns else 0
-    c6.metric("Faulty meters", faulty_n, f"{faulty_pending_n} awaiting replacement", delta_color="inverse")
+    metric_row([
+        ("Total meter points", total),
+        ("Installed", installed_n, f"{round(installed_n/total*100) if total else 0}% complete"),
+        ("Outstanding", outstanding_n),
+        ("Due within 14 days", due_soon_n),
+        ("Overdue", overdue_n, None, "inverse"),
+        ("Faulty meters", faulty_n, f"{faulty_pending_n} awaiting replacement", "inverse"),
+    ])
 
 st.divider()
 
@@ -2455,7 +2542,7 @@ if (highlightStands.size > 0) {{
 </html>
 """
 
-    components.html(html, height=900, scrolling=True)
+    components.html(html, height=650 if IS_MOBILE else 900, scrolling=True)
 
 # =====================================================================
 # ESTATE MAP TAB
@@ -2599,7 +2686,7 @@ if not is_apartments:
                     _gh, _dh + _fh, center, show_stand_labels, faulty_mode,
                     polygons, _kw, _ms, map_df
                 )
-                render_cached_map(map_html, height=660)
+                render_cached_map(map_html, height=430 if IS_MOBILE else 660)
 
             st.caption(
                 "Satellite imagery: Esri World Imagery. "
@@ -2991,14 +3078,15 @@ if not is_apartments:
 
         # ── KPI row ───────────────────────────────────────────────────
         st.markdown("#### AMR commissioned meters — import status")
-        k1,k2,k3,k4,k5,k6,k7 = st.columns(7)
-        k1.metric("AMR commissioned",    total_amr_inst)
-        k2.metric("🟢 <24h",  len(green),  f"{importing_pct}%")
-        k3.metric("🟡 1–3d",  len(yellow), f"{round(len(yellow)/total_amr_inst*100) if total_amr_inst else 0}%")
-        k4.metric("🟠 4–7d",  len(orange), f"{round(len(orange)/total_amr_inst*100) if total_amr_inst else 0}%")
-        k5.metric("🔴 7d+",   len(red),    f"{round(len(red)/total_amr_inst*100) if total_amr_inst else 0}%")
-        k6.metric("⚫ Never",  len(never),  f"{round(len(never)/total_amr_inst*100) if total_amr_inst else 0}%")
-        k7.metric("🔧 AMR pending", len(amr_pending_df), "meter in, AMR not fitted")
+        metric_row([
+            ("AMR commissioned", total_amr_inst),
+            ("🟢 <24h",  len(green),  f"{importing_pct}%"),
+            ("🟡 1–3d",  len(yellow), f"{round(len(yellow)/total_amr_inst*100) if total_amr_inst else 0}%"),
+            ("🟠 4–7d",  len(orange), f"{round(len(orange)/total_amr_inst*100) if total_amr_inst else 0}%"),
+            ("🔴 7d+",   len(red),    f"{round(len(red)/total_amr_inst*100) if total_amr_inst else 0}%"),
+            ("⚫ Never",  len(never),  f"{round(len(never)/total_amr_inst*100) if total_amr_inst else 0}%"),
+            ("🔧 AMR pending", len(amr_pending_df), "meter in, AMR not fitted"),
+        ])
 
         # ── Per-type summary rows (Electricity / Water / Hot Water separately) ──
         _type_icons = {"Electrical": "⚡", "Water": "💧", "Water (Cold)": "💧", "Water (Hot)": "♨️"}
@@ -3008,14 +3096,15 @@ if not is_apartments:
             _tcnt  = _tsub["status_badge"].value_counts()
             _ttot  = len(_tsub)
             _tg    = int(_tcnt.get("amr-green", 0))
-            t1, t2, t3, t4, t5, t6, t7 = st.columns(7)
-            t1.metric(f"{_type_icons.get(_tname,'')} {_tname}", _ttot)
-            t2.metric("🟢 <24h",  _tg, f"{round(_tg/_ttot*100) if _ttot else 0}%")
-            t3.metric("🟡 1–3d",  int(_tcnt.get("amr-yellow", 0)))
-            t4.metric("🟠 4–7d",  int(_tcnt.get("amr-orange", 0)))
-            t5.metric("🔴 7d+",   int(_tcnt.get("amr-red", 0)))
-            t6.metric("⚫ Never", int(_tcnt.get("amr-never", 0)))
-            t7.metric("🔧 Pending", len(_tpend))
+            metric_row([
+                (f"{_type_icons.get(_tname,'')} {_tname}", _ttot),
+                ("🟢 <24h",  _tg, f"{round(_tg/_ttot*100) if _ttot else 0}%"),
+                ("🟡 1–3d",  int(_tcnt.get("amr-yellow", 0))),
+                ("🟠 4–7d",  int(_tcnt.get("amr-orange", 0))),
+                ("🔴 7d+",   int(_tcnt.get("amr-red", 0))),
+                ("⚫ Never", int(_tcnt.get("amr-never", 0))),
+                ("🔧 Pending", len(_tpend)),
+            ])
 
         low_bat_meters   = amr_table[amr_table["low_battery"]==1]
         stale_and_faulty = amr_table[amr_table["status_badge"].isin(["amr-orange","amr-red","amr-never"]) &
@@ -3135,7 +3224,7 @@ if not is_apartments:
                     _fph = str(sorted(faulty_pending_df["stand"].tolist())) if not faulty_pending_df.empty else ""
                     with st.spinner("Building map…"):
                         _mobj = _cached_amr_map_obj(_gh, _dh, _ah, _fph)
-                        map_ret = st_folium(_mobj, use_container_width=True, height=500,
+                        map_ret = st_folium(_mobj, use_container_width=True, height=380 if IS_MOBILE else 500,
                                             returned_objects=["last_object_clicked_popup"],
                                             key="amr_click_map")
                     _clicked = (map_ret or {}).get("last_object_clicked_popup") or ""
@@ -3153,7 +3242,7 @@ if not is_apartments:
                     with st.spinner("Building map…"):
                         amr_map_html = cached_amr_map_html(_gh,_dh,_ah,_fph,_center,
                             _amr_polygons,_amr_kiosks,_amr_map_df,amr_readings,faulty_pending_df)
-                        render_cached_map(amr_map_html, height=500)
+                        render_cached_map(amr_map_html, height=380 if IS_MOBILE else 500)
                 leg = "<div style='display:flex;flex-wrap:wrap;gap:10px;font-size:11px;margin-top:4px'>"
                 for col,lbl in [("#2E7D52","🟢 <24h"),("#D4AC0D","🟡 1–3d"),("#E67E22","🟠 4–7d"),
                                  ("#BD4B2C","🔴 7d+"),("#607080","⚫ Never"),("#EF4444","⚠️ Faulty")]:
@@ -3364,7 +3453,7 @@ data.forEach(b => {{
   document.getElementById('root').appendChild(col);
 }});
 </script></body></html>"""
-        components.html(html, height=900, scrolling=True)
+        components.html(html, height=650 if IS_MOBILE else 900, scrolling=True)
 
 # =====================================================================
 # APARTMENT INSTALLED TAB (when in apartment mode)
@@ -3625,16 +3714,16 @@ if is_apartments and tab_floorplan is not None:
             if _rd and int(_rd.get("low_battery", 0)):
                 _lowbat += 1
         _tt = len(_amr_in)
-        s1, s2, s3, s4, s5, s6, s7, s8 = st.columns(8)
-        s1.metric(f"{_type_icons_fp.get(_t,'')} {_t}", _tt, "AMR commissioned")
-        s2.metric("🟢 <24h",  _badges["amr-green"],
-                  f"{round(_badges['amr-green']/_tt*100) if _tt else 0}%")
-        s3.metric("🟡 1–3d",  _badges["amr-yellow"])
-        s4.metric("🟠 4–7d",  _badges["amr-orange"])
-        s5.metric("🔴 7d+",   _badges["amr-red"])
-        s6.metric("⚫ Never",  _badges["amr-never"])
-        s7.metric("🔧 Pending", len(_pending))
-        s8.metric("🔋 Low bat", _lowbat)
+        metric_row([
+            (f"{_type_icons_fp.get(_t,'')} {_t}", _tt, "AMR commissioned"),
+            ("🟢 <24h",  _badges["amr-green"], f"{round(_badges['amr-green']/_tt*100) if _tt else 0}%"),
+            ("🟡 1–3d",  _badges["amr-yellow"]),
+            ("🟠 4–7d",  _badges["amr-orange"]),
+            ("🔴 7d+",   _badges["amr-red"]),
+            ("⚫ Never",  _badges["amr-never"]),
+            ("🔧 Pending", len(_pending)),
+            ("🔋 Low bat", _lowbat),
+        ])
 
     st.divider()
 
