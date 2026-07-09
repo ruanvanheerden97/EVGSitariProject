@@ -1,0 +1,32 @@
+name: Hourly AMR fetch
+
+on:
+  schedule:
+    # Every hour at :15 — gives the :50 SFTP push time to land.
+    # Note: GitHub cron can drift a few minutes; that's fine here.
+    - cron: "15 * * * *"
+  workflow_dispatch: {}   # allows manual "Run workflow" button
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pandas paramiko psycopg2-binary
+
+      - name: Fetch AMR readings into Supabase
+        env:
+          SFTP_HOST: ${{ secrets.SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.SFTP_PORT }}
+          SFTP_USERNAME: ${{ secrets.SFTP_USERNAME }}
+          SFTP_PASSWORD: ${{ secrets.SFTP_PASSWORD }}
+          SFTP_DIRECTORY: ${{ secrets.SFTP_DIRECTORY }}
+          DB_URL: ${{ secrets.DB_URL }}
+        run: python fetch_readings.py

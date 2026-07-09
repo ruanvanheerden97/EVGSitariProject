@@ -1659,12 +1659,26 @@ def summary_counters(view_df, full_df, label):
 
 
 # ---------- Site selector ----------
-_ASSETS = os.path.join(os.path.dirname(__file__), "assets")
-_EVG_LOGO = os.path.join(_ASSETS, "evergreen_sitari_logo.png")
-_VOL_LOGO = os.path.join(_ASSETS, "voltano_metering_logo.png")
+def _find_logo(*keywords):
+    """Find a logo image by keyword, tolerant of renamed files.
+    Searches assets/ and the repo root for png/jpg containing any keyword."""
+    base = os.path.dirname(__file__)
+    for folder in (os.path.join(base, "assets"), base):
+        if not os.path.isdir(folder):
+            continue
+        for f in sorted(os.listdir(folder)):
+            if not f.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                continue
+            name = f.lower()
+            if any(k in name for k in keywords):
+                return os.path.join(folder, f)
+    return None
+
+_EVG_LOGO = _find_logo("evergreen", "sitari", "estate")
+_VOL_LOGO = _find_logo("voltano")
 
 # Voltano logo pinned in the Streamlit header (top-left)
-if os.path.exists(_VOL_LOGO):
+if _VOL_LOGO:
     try:
         st.logo(_VOL_LOGO, size="large")
     except Exception:
@@ -1672,20 +1686,20 @@ if os.path.exists(_VOL_LOGO):
 
 if IS_MOBILE:
     # Compact stacked header for phones
-    if os.path.exists(_EVG_LOGO):
+    if _EVG_LOGO:
         st.image(_EVG_LOGO, width=210)
     st.markdown("### 🔧 Sitari Evergreen — Meter Commissioning")
     st.caption("Erf 1186 Sitari · Lifestyle Retirement Village · managed by **Voltano Metering**")
 else:
     hc1, hc2, hc3 = st.columns([1.3, 3, 1.3])
     with hc1:
-        if os.path.exists(_EVG_LOGO):
+        if _EVG_LOGO:
             st.image(_EVG_LOGO, use_container_width=True)
     with hc2:
         st.title("🔧 Sitari Evergreen — Meter Commissioning")
         st.caption("Erf 1186 Sitari · Lifestyle Retirement Village · managed by **Voltano Metering**")
     with hc3:
-        if os.path.exists(_VOL_LOGO):
+        if _VOL_LOGO:
             st.image(_VOL_LOGO, use_container_width=True)
 
 # Handle stand-click links from the apartment floor plan (query params).
