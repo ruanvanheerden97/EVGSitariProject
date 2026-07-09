@@ -332,6 +332,111 @@ def load_latest_from_db():
         return {}
 
 
+# ── Stock / inventory (freestanding project) ─────────────────────────────────
+STOCK_SEED = [
+    # item_key, label, qty, reorder_level
+    ("water_box",         "Water meter boxes (only)",              15, 5),
+    ("water_meter",       "Water meters · 20mm Axioma",            10, 5),
+    ("elec_programmed",   "Hexing electricity meters · programmed", 42, 10),
+    ("elec_unprogrammed", "Hexing electricity meters · unprogrammed", 30, 10),
+]
+
+
+def _db_stock_init(conn):
+    """Ensure stock tables exist and seed initial counts if empty."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_items (
+                item_key      TEXT PRIMARY KEY,
+                label         TEXT,
+                baseline_qty  INTEGER NOT NULL,
+                baseline_date TEXT NOT NULL,
+                reorder_level INTEGER DEFAULT 5
+            )""")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_adjustments (
+                id         SERIAL PRIMARY KEY,
+                item_key   TEXT NOT NULL,
+                qty_change INTEGER NOT NULL,
+                note       TEXT,
+                created_at TEXT NOT NULL
+            )""")
+        cur.execute("SELECT COUNT(*) FROM stock_items")
+        if cur.fetchone()[0] == 0:
+            now_iso = datetime.now().isoformat()
+            for key, label, qty, reorder in STOCK_SEED:
+                cur.execute(
+                    "INSERT INTO stock_items (item_key, label, baseline_qty, baseline_date, reorder_level) "
+                    "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (item_key) DO NOTHING",
+                    (key, label, qty, now_iso, reorder))
+    conn.commit()
+
+
+def db_stock_get():
+    """Return {item_key: {label, baseline_qty, baseline_date, reorder_level, adjustments}}."""
+    if not PSYCOPG2_AVAILABLE or not _get_db_url():
+        return {}
+    try:
+        conn = _db_conn()
+        _db_stock_init(conn)
+        out = {}
+        with conn.cursor() as cur:
+            cur.execute("SELECT item_key, label, baseline_qty, baseline_date, reorder_level FROM stock_items")
+            for key, label, bqty, bdate, reorder in cur.fetchall():
+                cur2 = conn.cursor()
+                cur2.execute(
+                    "SELECT COALESCE(SUM(qty_change),0) FROM stock_adjustments "
+                    "WHERE item_key=%s AND created_at > %s", (key, bdate))
+                adj = cur2.fetchone()[0] or 0
+                cur2.close()
+                out[key] = {"label": label, "baseline_qty": bqty,
+                            "baseline_date": bdate, "reorder_level": reorder,
+                            "adjustments": int(adj)}
+        conn.close()
+        return out
+    except Exception:
+        return {}
+
+
+def db_stock_adjust(item_key, qty_change, note=""):
+    """Record a manual stock movement (+ received, − issued/correction)."""
+    if not PSYCOPG2_AVAILABLE or not _get_db_url():
+        return False
+    try:
+        conn = _db_conn()
+        _db_stock_init(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO stock_adjustments (item_key, qty_change, note, created_at) VALUES (%s,%s,%s,%s)",
+                (item_key, int(qty_change), note, datetime.now().isoformat()))
+        conn.commit(); conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def db_stock_set_baseline(item_key, qty, reorder_level=None):
+    """Stocktake: set a new counted quantity as of now (resets auto-deduction from today)."""
+    if not PSYCOPG2_AVAILABLE or not _get_db_url():
+        return False
+    try:
+        conn = _db_conn()
+        _db_stock_init(conn)
+        with conn.cursor() as cur:
+            if reorder_level is not None:
+                cur.execute(
+                    "UPDATE stock_items SET baseline_qty=%s, baseline_date=%s, reorder_level=%s WHERE item_key=%s",
+                    (int(qty), datetime.now().isoformat(), int(reorder_level), item_key))
+            else:
+                cur.execute(
+                    "UPDATE stock_items SET baseline_qty=%s, baseline_date=%s WHERE item_key=%s",
+                    (int(qty), datetime.now().isoformat(), item_key))
+        conn.commit(); conn.close()
+        return True
+    except Exception:
+        return False
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def db_get_consumption(start_iso, end_iso, tol_hours=3):
     """
@@ -1801,11 +1906,12 @@ if is_apartments:
     tab_outstanding = tab_upcoming = tab_overdue = tab_calendar = None
     tab_sections = tab_retic = tab_map = tab_faulty = None
     tab_amr = None
+    tab_stock = None
 else:
-    tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic, tab_map, tab_faulty, tab_balance, tab_amr = st.tabs(
+    tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic, tab_map, tab_faulty, tab_stock, tab_balance, tab_amr = st.tabs(
         ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed",
          "📅 Calendar", "📊 Sections", "⚡ Reticulation", "🗺️ Estate Map",
-         "⚠️ Faulty Meters", "⚖️ Balancing", "📡 AMR Live"]
+         "⚠️ Faulty Meters", "📦 Stock", "⚖️ Balancing", "📡 AMR Live"]
     )
     tab_aprt_retic = None
     tab_floorplan = None
@@ -3950,3 +4056,176 @@ if is_apartments and tab_floorplan is not None:
     if sel_fp:
         st.session_state["fp_selected_stand"] = sel_fp
         render_stand_history(sel_fp, df, key_prefix="fp")
+
+# =====================================================================
+# STOCK TAB — inventory tracking with auto-deduction (freestanding)
+# =====================================================================
+if not is_apartments and tab_stock is not None:
+ with tab_stock:
+    st.subheader("📦 Stock on Hand — Freestanding Project")
+    st.caption(
+        "Stock counts auto-deduct from your commissioning spreadsheet: installations and faulty "
+        "replacements **dated after the last stocktake** reduce the relevant item automatically. "
+        "Use the forms below when you receive stock, program meters, or do a recount."
+    )
+
+    stock = db_stock_get()
+    if not stock:
+        st.warning("Stock tracking needs the Supabase database connection ([db] url in secrets). "
+                   "Once connected, initial counts are seeded automatically.")
+    else:
+        # ── Auto-consumption from the spreadsheet since each baseline ──
+        def _consumed_since(item_key, baseline_iso):
+            """Units consumed after the baseline date, per item rules."""
+            try:
+                bdate = pd.Timestamp(datetime.fromisoformat(baseline_iso).date())
+            except Exception:
+                return 0, ""
+            water = df[df["meter_type"] == "Water"]
+            elec  = df[df["meter_type"] == "Electrical"]
+            if item_key == "water_meter":
+                inst = int((water["commission_date"] > bdate).sum())
+                repl = int((water["faulty_replaced"] & (water["replacement_date"] > bdate)).sum())
+                return inst + repl, f"{inst} installs + {repl} replacements"
+            if item_key == "water_box":
+                inst = int((water["commission_date"] > bdate).sum())
+                return inst, f"{inst} new installs (replacements reuse box)"
+            if item_key == "elec_programmed":
+                inst = int((elec["commission_date"] > bdate).sum())
+                repl = int((elec["faulty_replaced"] & (elec["replacement_date"] > bdate)).sum()) \
+                       if "faulty_replaced" in elec.columns else 0
+                return inst + repl, f"{inst} installs + {repl} replacements"
+            return 0, "manual only (not auto-deducted)"
+
+        # ── Current levels ──────────────────────────────────────────────
+        ITEM_ICONS = {"water_box": "🧰", "water_meter": "💧",
+                      "elec_programmed": "⚡", "elec_unprogrammed": "🔌"}
+        levels = {}
+        low_items = []
+        for key, s in stock.items():
+            used, used_note = _consumed_since(key, s["baseline_date"])
+            current = s["baseline_qty"] + s["adjustments"] - used
+            levels[key] = {"current": current, "used": used, "used_note": used_note, **s}
+            if current <= s["reorder_level"]:
+                low_items.append((key, current, s["reorder_level"]))
+
+        if low_items:
+            st.error("🚨 **Reorder needed:** " + " · ".join(
+                f"{ITEM_ICONS.get(k,'')} {stock[k]['label']} — {c} left (reorder at {r})"
+                for k, c, r in low_items))
+
+        order = ["water_meter", "water_box", "elec_programmed", "elec_unprogrammed"]
+        metric_row([
+            (f"{ITEM_ICONS.get(k,'')} {levels[k]['label']}", levels[k]["current"],
+             f"−{levels[k]['used']} used since count" if levels[k]["used"] else "no usage since count",
+             "inverse" if levels[k]["current"] <= levels[k]["reorder_level"] else "off")
+            for k in order if k in levels
+        ], desktop_cols=4)
+
+        with st.expander("ℹ️ How each count is calculated"):
+            for k in order:
+                if k not in levels:
+                    continue
+                l = levels[k]
+                bdate_s = l["baseline_date"][:10]
+                st.caption(
+                    f"{ITEM_ICONS.get(k,'')} **{l['label']}** = {l['baseline_qty']} counted on {bdate_s} "
+                    f"{'+' if l['adjustments'] >= 0 else '−'} {abs(l['adjustments'])} manual adjustments "
+                    f"− {l['used']} auto-deducted ({l['used_note']}) = **{l['current']}**")
+
+        st.divider()
+
+        # ── Demand & allocation ─────────────────────────────────────────
+        st.markdown("##### 📋 Demand vs stock — allocation guide")
+        water = df[df["meter_type"] == "Water"]
+        elec  = df[df["meter_type"] == "Electrical"]
+        w_out  = int((~water["installed"]).sum())
+        e_out  = int((~elec["installed"]).sum())
+        w_flt  = int((water["faulty"] & ~water["faulty_replaced"]).sum())
+        e_flt  = int((elec["faulty"] & ~elec["faulty_replaced"]).sum()) if "faulty" in elec.columns else 0
+
+        def _alloc_line(icon, label, stock_now, n_faulty, n_installs, extra=""):
+            to_faulty   = min(stock_now, n_faulty)
+            to_installs = min(max(stock_now - to_faulty, 0), n_installs)
+            shortfall   = (n_faulty + n_installs) - stock_now
+            cols = st.columns([2.2, 1.2, 1.6, 1.6, 2])
+            cols[0].markdown(f"{icon} **{label}**")
+            cols[1].markdown(f"Stock: **{stock_now}**")
+            cols[2].markdown(f"→ faulty replacements: **{to_faulty}** / {n_faulty}")
+            cols[3].markdown(f"→ new installs: **{to_installs}** / {n_installs}")
+            if shortfall > 0:
+                cols[4].markdown(f"<span style='color:#BD4B2C;font-weight:700'>Order ≥ {shortfall}</span>"
+                                 + (f" <span style='color:#7A96B2;font-size:12px'>{extra}</span>" if extra else ""),
+                                 unsafe_allow_html=True)
+            else:
+                cols[4].markdown(f"<span style='color:#2E7D52;font-weight:700'>✓ covered</span>"
+                                 + (f" <span style='color:#7A96B2;font-size:12px'>{extra}</span>" if extra else ""),
+                                 unsafe_allow_html=True)
+
+        _alloc_line("💧", "Water meters (Axioma 20mm)",
+                    levels.get("water_meter", {}).get("current", 0), w_flt, w_out)
+        _alloc_line("🧰", "Water meter boxes",
+                    levels.get("water_box", {}).get("current", 0), 0, w_out,
+                    extra="boxes needed for new installs only")
+        _unprog = levels.get("elec_unprogrammed", {}).get("current", 0)
+        _alloc_line("⚡", "Elec meters (programmed)",
+                    levels.get("elec_programmed", {}).get("current", 0), e_flt, e_out,
+                    extra=f"+{_unprog} unprogrammed available to program")
+        st.caption("Allocation prioritises faulty replacements first, then new installations. "
+                   "'Order' figures ignore unprogrammed units — program those first to extend cover.")
+
+        st.divider()
+
+        # ── Actions ────────────────────────────────────────────────────
+        ac1, ac2, ac3 = st.columns(3)
+
+        with ac1:
+            st.markdown("**➕ Receive / adjust stock**")
+            with st.form("stock_adjust_form", clear_on_submit=True):
+                _keys = [k for k in order if k in stock]
+                a_item = st.selectbox("Item", _keys,
+                                      format_func=lambda k: f"{ITEM_ICONS.get(k,'')} {stock[k]['label']}")
+                a_qty  = st.number_input("Quantity (+ received / − issued)", min_value=-500,
+                                         max_value=500, value=0, step=1)
+                a_note = st.text_input("Note (e.g. 'PO 1234 delivery')")
+                if st.form_submit_button("Save movement") and a_qty != 0:
+                    if db_stock_adjust(a_item, a_qty, a_note):
+                        st.success(f"Recorded {a_qty:+d} × {stock[a_item]['label']}")
+                        st.rerun()
+                    else:
+                        st.error("Could not save — check DB connection.")
+
+        with ac2:
+            st.markdown("**🔧 Program Hexing meters**")
+            with st.form("stock_program_form", clear_on_submit=True):
+                p_qty = st.number_input("Move unprogrammed → programmed", min_value=1,
+                                        max_value=500, value=1, step=1)
+                if st.form_submit_button("Program"):
+                    ok1 = db_stock_adjust("elec_unprogrammed", -int(p_qty), "programmed batch")
+                    ok2 = db_stock_adjust("elec_programmed",  int(p_qty), "programmed batch")
+                    if ok1 and ok2:
+                        st.success(f"Moved {int(p_qty)} meters to programmed stock")
+                        st.rerun()
+                    else:
+                        st.error("Could not save — check DB connection.")
+
+        with ac3:
+            st.markdown("**🔄 Stocktake (reset count)**")
+            with st.form("stock_baseline_form", clear_on_submit=True):
+                _keys = [k for k in order if k in stock]
+                b_item = st.selectbox("Item", _keys, key="bl_item",
+                                      format_func=lambda k: f"{ITEM_ICONS.get(k,'')} {stock[k]['label']}")
+                b_qty  = st.number_input("Counted quantity on hand", min_value=0,
+                                         max_value=10000, value=0, step=1)
+                b_reo  = st.number_input("Reorder alert level", min_value=0, max_value=1000,
+                                         value=5, step=1)
+                if st.form_submit_button("Set new count"):
+                    if db_stock_set_baseline(b_item, b_qty, b_reo):
+                        st.success(f"{stock[b_item]['label']} reset to {int(b_qty)} as of today")
+                        st.rerun()
+                    else:
+                        st.error("Could not save — check DB connection.")
+
+        st.caption("Movements and counts are stored in Supabase and survive app redeploys. "
+                   "Auto-deduction uses the spreadsheet's Meter Commission Date and Replacement Date "
+                   "columns — keep those up to date and stock stays accurate by itself.")
