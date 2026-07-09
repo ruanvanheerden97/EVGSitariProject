@@ -2695,7 +2695,8 @@ if not is_apartments:
             # Re-load kiosk number per stand from the Excel file directly
             try:
                 _xls = pd.ExcelFile(data_path)
-                _edf = _xls.parse("Elec Meters")
+                _elec_sheet_name = find_sheet(_xls, ELEC_SHEET_CANDIDATES)
+                _edf = _xls.parse(_elec_sheet_name)
                 _edf.columns = [str(c).strip() for c in _edf.columns]
                 _edf["stand_str"] = _edf["Stand Number"].astype(str).str.strip()
                 kiosk_stands_map = (
