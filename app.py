@@ -333,15 +333,23 @@ def load_latest_from_db():
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def db_get_consumption(start_iso, end_iso):
+def db_get_consumption(start_iso, end_iso, tol_hours=3):
     """
-    Per-serial consumption over a window: last reading minus first reading.
-    Returns {serial: {"delta": float, "first": v, "last": v, "n": count}}.
-    Serials with fewer than 2 readings in the window are omitted (treated as no data).
+    Timestamp-ALIGNED consumption per serial, for fair parent-vs-children
+    comparison. Every meter's usage is taken between its readings closest
+    to the SAME two anchor times (window start and window end), within
+    ±tol_hours. A meter without a reading near both anchors is treated as
+    having no usable data for the window.
+
+    Returns {serial: {delta, first, last, t_first, t_last, span_hours, n}}.
     """
     if not PSYCOPG2_AVAILABLE or not _get_db_url():
         return {}
     try:
+        t0 = pd.Timestamp(start_iso)
+        t1 = pd.Timestamp(end_iso)
+        tol = pd.Timedelta(hours=tol_hours)
+
         conn = _db_conn()
         df = pd.read_sql_query(
             """SELECT serial, reading_date, reading_value
@@ -349,20 +357,34 @@ def db_get_consumption(start_iso, end_iso):
                WHERE reading_date >= %s AND reading_date <= %s
                  AND reading_value IS NOT NULL
                ORDER BY serial, reading_date""",
-            conn, params=(start_iso, end_iso)
+            conn, params=((t0 - tol).isoformat(), (t1 + tol).isoformat())
         )
         conn.close()
-        result = {}
         if df.empty:
-            return result
+            return {}
+        df["reading_dt"] = pd.to_datetime(df["reading_date"], errors="coerce")
+        df = df[df["reading_dt"].notna()]
+
+        result = {}
         for serial, grp in df.groupby("serial"):
-            if len(grp) < 2:
+            grp = grp.sort_values("reading_dt").reset_index(drop=True)
+            # Reading closest to each anchor, within tolerance
+            d0 = (grp["reading_dt"] - t0).abs()
+            d1 = (grp["reading_dt"] - t1).abs()
+            i0 = int(d0.idxmin())
+            i1 = int(d1.idxmin())
+            if d0.loc[i0] > tol or d1.loc[i1] > tol or i1 <= i0:
                 continue
-            first_v = float(grp["reading_value"].iloc[0])
-            last_v  = float(grp["reading_value"].iloc[-1])
+            v0 = float(grp["reading_value"].iloc[i0])
+            v1 = float(grp["reading_value"].iloc[i1])
+            span = (grp["reading_dt"].iloc[i1] - grp["reading_dt"].iloc[i0]).total_seconds() / 3600
             result[str(serial)] = {
-                "delta": max(last_v - first_v, 0.0),
-                "first": first_v, "last": last_v, "n": len(grp),
+                "delta": max(v1 - v0, 0.0),
+                "first": v0, "last": v1,
+                "t_first": grp["reading_dt"].iloc[i0].isoformat(),
+                "t_last":  grp["reading_dt"].iloc[i1].isoformat(),
+                "span_hours": round(span, 1),
+                "n": len(grp),
             }
         return result
     except Exception:
@@ -3495,42 +3517,84 @@ with tab_balance:
         "difference (losses) until their readings import."
     )
 
-    bal_period = st.radio("Period", ["Last 24h", "Last 3 days", "Last 7 days", "Last 30 days"],
-                          horizontal=True, key="bal_period")
+    bal_c1, bal_c2 = st.columns([2.2, 1.4])
+    with bal_c1:
+        bal_period = st.radio("Period", ["Last 24h", "Last 3 days", "Last 7 days", "Last 30 days"],
+                              horizontal=True, key="bal_period")
+    with bal_c2:
+        bal_tol = st.radio("Anchor tolerance", ["±1h", "±3h", "±6h"], index=1,
+                           horizontal=True, key="bal_tol",
+                           help="Each meter's usage is measured between its readings closest to the "
+                                "same two anchor times (window start & end). This sets how far a "
+                                "reading may be from the anchor before the meter counts as unmetered.")
     _hours = {"Last 24h": 24, "Last 3 days": 72, "Last 7 days": 168, "Last 30 days": 720}[bal_period]
+    _tol_h = {"±1h": 1, "±3h": 3, "±6h": 6}[bal_tol]
     _end   = datetime.now()
     _start = _end - timedelta(hours=_hours)
-    cons = db_get_consumption(_start.isoformat(), _end.isoformat())
+    cons = db_get_consumption(_start.isoformat(), _end.isoformat(), _tol_h)
 
     if not cons:
         st.info("No consumption data in the selected window yet — the history DB fills up as hourly readings import.")
     else:
-        st.caption(f"Window: {_start.strftime('%d %b %H:%M')} → {_end.strftime('%d %b %H:%M')} · "
-                   f"**{len(cons)}** serials with usable readings")
+        _spans = [c["span_hours"] for c in cons.values()]
+        st.caption(
+            f"Aligned window: **{_start.strftime('%d %b %H:%M')} → {_end.strftime('%d %b %H:%M')}** "
+            f"(anchors {bal_tol}) · **{len(cons)}** meters aligned · "
+            f"typical measured span {min(_spans):.0f}–{max(_spans):.0f}h"
+        )
 
         def _delta(serial):
             c = cons.get(str(serial).strip())
             return c["delta"] if c else None
 
         def _bal_row(label, parent_serial, child_sum, child_missing, indent=0):
-            """Render one balancing line: parent vs children with loss."""
+            """
+            One balancing line: parent vs measured children.
+            If the parent has a reading and some children don't, the residual
+            (parent − measured) is attributed to the unmetered children as an
+            ESTIMATE, clearly flagged, until real readings arrive.
+            """
             pad = "&nbsp;" * (indent * 6)
             p = _delta(parent_serial)
-            cols = st.columns([2.4, 1.2, 1.2, 1.2, 2])
+            cols = st.columns([2.2, 1.1, 1.1, 1.3, 1.3, 1.6])
             cols[0].markdown(f"{pad}**{label}**", unsafe_allow_html=True)
             cols[1].markdown(f"Parent: **{p:,.1f}** kWh" if p is not None else "Parent: *no reading*")
-            cols[2].markdown(f"Children: **{child_sum:,.1f}** kWh")
-            if p is not None:
-                loss = p - child_sum
+            cols[2].markdown(f"Measured: **{child_sum:,.1f}** kWh")
+
+            if p is None:
+                cols[3].markdown("Est.: —")
+                cols[4].markdown("Diff: *n/a*")
+                cols[5].caption(f"{child_missing} unmetered child meter(s)" if child_missing else "")
+                return
+
+            residual = p - child_sum
+            if child_missing > 0:
+                est = max(residual, 0.0)
+                cols[3].markdown(
+                    f"<span style='color:#8B5CF6;font-weight:700'>Est.: {est:,.1f} kWh</span>",
+                    unsafe_allow_html=True)
+                if residual >= 0:
+                    cols[4].markdown(
+                        "<span style='color:#2E7D52;font-weight:700'>0.0 kWh (est. applied)</span>",
+                        unsafe_allow_html=True)
+                    cols[5].caption(f"residual attributed to {child_missing} unmetered meter(s) "
+                                    f"(~{est/child_missing:,.1f} kWh each)")
+                else:
+                    pctl = (residual / p * 100) if p > 0 else 0
+                    cols[4].markdown(
+                        f"<span style='color:#BD4B2C;font-weight:700'>{residual:+,.1f} kWh ({pctl:+.1f}%)</span>",
+                        unsafe_allow_html=True)
+                    cols[5].caption(f"⚠ children exceed parent — check alignment / CT ratios "
+                                    f"({child_missing} unmetered)")
+            else:
+                loss = residual
                 pctl = (loss / p * 100) if p > 0 else 0
                 colr = "#BD4B2C" if pctl > 10 else "#E69138" if pctl > 3 else "#2E7D52"
-                cols[3].markdown(
+                cols[3].markdown("Est.: —")
+                cols[4].markdown(
                     f"<span style='color:{colr};font-weight:700'>{loss:+,.1f} kWh ({pctl:+.1f}%)</span>",
                     unsafe_allow_html=True)
-            else:
-                cols[3].markdown("Loss: *n/a*")
-            note = f"{child_missing} child meter(s) without readings" if child_missing else ""
-            cols[4].caption(note)
+                cols[5].caption("technical losses" if abs(pctl) <= 10 else "high — investigate")
 
         # ── Load hierarchies ────────────────────────────────────────────
         fs_hier   = load_kiosk_data(data_path, mtime)
@@ -3619,19 +3683,32 @@ with tab_balance:
                         + (f" ({bulk_virtual_missing} check meters also without readings)" if bulk_virtual_missing else "")
                         + ". Replaced automatically once the bulk meter starts importing."
                     )
+                # Per-child estimate share for the detail lines below
+                _ms_p = _delta(ms_serial)
+                _est_each = None
+                if _ms_p is not None and miss_total > 0:
+                    _est_total = max(_ms_p - children_total, 0.0)
+                    _est_each = _est_total / miss_total if miss_total else 0.0
                 st.markdown("---")
                 st.markdown("**Kiosks** (sum of stand meters per kiosk)")
                 for kname, ksum, khave, kmiss in kiosk_details:
                     kc = st.columns([2, 1.4, 2])
                     kc[0].caption(f"⚡ {kname}")
                     kc[1].caption(f"{ksum:,.1f} kWh · {khave} meters")
-                    kc[2].caption(f"{kmiss} without readings" if kmiss else "")
+                    if kmiss and _est_each is not None:
+                        kc[2].caption(f"{kmiss} unmetered · est. ~{_est_each * kmiss:,.1f} kWh")
+                    else:
+                        kc[2].caption(f"{kmiss} without readings" if kmiss else "")
                 if bulk_label:
                     bc = st.columns([2, 1.4, 2])
                     bc[0].caption(f"🏢 {bulk_label}")
                     bc[1].caption(f"{bulk_delta:,.1f} kWh" if bulk_delta is not None else "no reading")
-                    bc[2].caption("virtual — Σ of check meters" if bulk_virtual
-                                  else ("" if bulk_delta is not None else "counted in losses"))
+                    if bulk_virtual:
+                        bc[2].caption("virtual — Σ of check meters")
+                    elif bulk_delta is None and _est_each is not None:
+                        bc[2].caption(f"est. ~{_est_each:,.1f} kWh")
+                    else:
+                        bc[2].caption("" if bulk_delta is not None else "counted in losses")
 
         # ── Level 2 & 3: Apartment blocks ──────────────────────────────
         st.markdown("#### Levels 2–3 — Apartment blocks")
@@ -3675,20 +3752,26 @@ with tab_balance:
                     else:
                         # Lift / UPS / Plant, or DB with no children yet → own usage only
                         cd = _delta(c["serial"])
-                        cc = st.columns([2.4, 1.2, 1.2, 1.2, 2])
+                        cc = st.columns([2.2, 1.1, 1.1, 1.3, 1.3, 1.6])
                         cc[0].markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**{cname}** ({c['serial']})",
                                        unsafe_allow_html=True)
                         cc[1].markdown(f"Usage: **{cd:,.1f}** kWh" if cd is not None else "Usage: *no reading*")
                         cc[2].markdown("—")
                         cc[3].markdown("—")
-                        cc[4].caption("end-point load (no child meters)" if cd is not None
+                        cc[4].markdown("—")
+                        cc[5].caption("end-point load (no child meters)" if cd is not None
                                       else "no child meters · no reading yet")
 
         st.caption(
-            "Consumption = last reading − first reading per serial within the window. "
-            "A negative difference usually means some children lack readings for part of the window. "
-            "Minisub and bulk check meters that aren't yet on AMR show as 'no reading' — "
-            "balancing at that level becomes available once they import."
+            "**Methodology** — Timestamp-aligned consumption: every meter's usage is measured between "
+            "its readings closest to the same two anchor times (window start and end, within the "
+            "selected tolerance), so parents and children are compared over the same physical period. "
+            "Meters that can't be aligned count as unmetered. Where a parent has a reading but some "
+            "children don't, the positive residual (parent − measured children) is shown as an "
+            "**estimate** attributed to the unmetered meters — clearly flagged in purple — and is "
+            "replaced by real data automatically as those meters come online. A parent-less level "
+            "(e.g. a bulk meter without AMR) uses the sum of its children as a virtual parent until "
+            "its own readings arrive."
         )
 
 # =====================================================================
