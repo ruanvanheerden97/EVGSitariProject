@@ -1830,26 +1830,49 @@ else:
             st.image(_VOL_LOGO, use_container_width=True)
 
 # Handle stand-click links from the apartment floor plan (query params).
-# Must run BEFORE the radio is instantiated so we can steer it to Apartments.
+# Must run BEFORE the sidebar widgets so we can steer them.
 _qp_stand = st.query_params.get("sel_stand")
 if _qp_stand:
     st.session_state["fp_selected_stand"] = _qp_stand
     if st.query_params.get("view") == "apartments":
         st.session_state["site_type"] = "🏢 Apartments"
+        st.session_state["workspace"] = "📊 Meter Management"
+        st.session_state["page_met"]  = "AMR Live"
     st.query_params.clear()
 
-col_title, col_switch = st.columns([3, 1])
-with col_switch:
-    site_type = st.radio(
-        "View", ["🏠 Freestanding", "🏢 Apartments"],
-        horizontal=True, key="site_type",
-        label_visibility="collapsed"
-    )
-with col_title:
+# ---------- Sidebar navigation ----------
+WORKSPACES = {
+    "🏘️ Estate Management": ["Outstanding", "Upcoming", "Overdue", "Installed",
+                              "Calendar", "Sections", "Reticulation",
+                              "Faulty Meters", "Stock"],
+    "📊 Meter Management":  ["Estate Map", "AMR Live", "Balancing"],
+}
+_PAGE_ICONS = {
+    "Outstanding": "🟦", "Upcoming": "🟧", "Overdue": "🟥", "Installed": "🟩",
+    "Calendar": "📅", "Sections": "📊", "Reticulation": "⚡",
+    "Faulty Meters": "⚠️", "Stock": "📦",
+    "Estate Map": "🗺️", "AMR Live": "📡", "Balancing": "⚖️",
+}
+
+with st.sidebar:
+    st.markdown("## 🧭 Navigation")
+    workspace = st.radio("Workspace", list(WORKSPACES.keys()), key="workspace")
+
+    _page_key = "page_est" if "Estate" in workspace else "page_met"
+    _pages = WORKSPACES[workspace]
+    _PAGE = st.radio("Page", _pages, key=_page_key,
+                     format_func=lambda p: f"{_PAGE_ICONS.get(p,'')} {p}")
+
+    st.divider()
+    site_type = st.radio("Scope", ["🏠 Freestanding", "🏢 Apartments", "🌍 All"],
+                         key="site_type")
     st.toggle("📱 Compact mobile layout", key="is_mobile",
               help="Auto-detected from your device — flip manually if the layout looks off.")
-site_key = "freestanding" if "Freestanding" in site_type else "apartments"
-is_apartments = site_key == "apartments"
+    st.caption("Voltano Metering · Evergreen Sitari")
+
+is_apartments = "Apartments" in site_type
+scope_all     = "All" in site_type
+site_key      = "apartments" if is_apartments else "freestanding"
 
 # ---------- Load data ----------
 data_path = find_data_file()
@@ -1858,15 +1881,21 @@ if not data_path:
     st.stop()
 
 mtime = os.path.getmtime(data_path)
-df = load_data(data_path, mtime, site_key)
+if scope_all:
+    _df_fs  = load_data(data_path, mtime, "freestanding")
+    _df_apt = load_data(data_path, mtime, "apartments")
+    df = pd.concat([_df_fs, _df_apt], ignore_index=True) if not _df_apt.empty else _df_fs
+else:
+    df = load_data(data_path, mtime, site_key)
 
 if df.empty:
     st.error("Couldn't find the required sheets in this file. Check the sheet names.")
     st.stop()
 
+_scope_label = "🌍 Whole site" if scope_all else ("🏢 Apartments" if is_apartments else "🏠 Freestanding")
 st.caption(
     f"📂 Using **{os.path.basename(data_path)}** · last updated {datetime.fromtimestamp(mtime).strftime('%d %b %Y, %H:%M')}"
-    + (" · 🏢 Apartments view" if is_apartments else " · 🏠 Freestanding view")
+    f" · {_scope_label}"
 )
 
 # ---------- KPI strip (always visible) ----------
@@ -1897,39 +1926,27 @@ else:
 
 st.divider()
 
-# ---------- Tabs ----------
-if is_apartments:
-    tab_floorplan, tab_installed, tab_aprt_retic, tab_balance = st.tabs(
-        ["🏬 Floor Plan", "🟩 Installed", "🏢 Apt Reticulation", "⚖️ Balancing"]
-    )
-    # Unused stubs for apartment mode (tabs don't exist, set to None)
-    tab_outstanding = tab_upcoming = tab_overdue = tab_calendar = None
-    tab_sections = tab_retic = tab_map = tab_faulty = None
-    tab_amr = None
-    tab_stock = None
-else:
-    tab_outstanding, tab_upcoming, tab_overdue, tab_installed, tab_calendar, tab_sections, tab_retic, tab_map, tab_faulty, tab_stock, tab_balance, tab_amr = st.tabs(
-        ["🟦 Outstanding", "🟧 Upcoming", "🟥 Overdue", "🟩 Installed",
-         "📅 Calendar", "📊 Sections", "⚡ Reticulation", "🗺️ Estate Map",
-         "⚠️ Faulty Meters", "📦 Stock", "⚖️ Balancing", "📡 AMR Live"]
-    )
-    tab_aprt_retic = None
-    tab_floorplan = None
+# ---------- Page banner (navigation lives in the left sidebar) ----------
+_FS_ONLY_PAGES = {"Outstanding", "Upcoming", "Overdue", "Calendar", "Sections",
+                  "Faulty Meters", "Stock", "Estate Map"}
+st.markdown(f"### {_PAGE_ICONS.get(_PAGE, '')} {_PAGE}")
+if is_apartments and _PAGE in _FS_ONLY_PAGES:
+    st.info(f"**{_PAGE}** applies to the freestanding project (apartments have no "
+            f"{'stock or ' if _PAGE == 'Stock' else ''}snag-date tracking here). "
+            "Switch the scope to 🏠 Freestanding or 🌍 All in the sidebar to view it.")
 
 COLS   = ["stand", "meter_type", "unit_type", "wbho_section", "deadline", "status"]
 RENAME = {"stand":"Stand","meter_type":"Type","unit_type":"Unit type",
           "wbho_section":"Section","deadline":"Deadline (Snag 4)","status":"Status"}
 
-if not is_apartments:
- with tab_outstanding:
+if _PAGE == "Outstanding" and not is_apartments:
     st.subheader("All outstanding meters")
     outstanding_full = df[~df["installed"]]
     filtered = status_filters(outstanding_full, "outstanding")
     summary_counters(filtered, outstanding_full, "outstanding")
     show_table(filtered, COLS, RENAME, sort_col="deadline")
 
-if not is_apartments:
- with tab_upcoming:
+if _PAGE == "Upcoming" and not is_apartments:
     st.subheader("Due within the next 14 days")
     due_soon_full = df[df["status"] == "Due soon"]
     filtered = status_filters(due_soon_full, "upcoming")
@@ -1945,8 +1962,7 @@ if not is_apartments:
             with st.expander(f"Week of {week_start.strftime('%d %b')} – {week_end.strftime('%d %b %Y')} · {len(group)} meters"):
                 show_table(group, COLS, RENAME, sort_col="deadline")
 
-if not is_apartments:
- with tab_overdue:
+if _PAGE == "Overdue" and not is_apartments:
     st.subheader("Behind schedule — past Snag Date 4, not yet installed")
     overdue_full = df[df["status"] == "Overdue"]
     filtered = status_filters(overdue_full, "overdue")
@@ -1962,7 +1978,7 @@ if not is_apartments:
     else:
         st.success("Nothing overdue right now. 🎉")
 
-with tab_installed:
+if _PAGE == "Installed" and not is_apartments:
     st.subheader("Installed meters log")
     installed_full = df[df["installed"]]
 
@@ -1991,8 +2007,7 @@ with tab_installed:
         sort_col="commission_date", ascending=False,
     )
 
-if not is_apartments:
- with tab_calendar:
+if _PAGE == "Calendar" and not is_apartments:
     st.subheader("Calendar view")
     st.caption("✅ installed · 🟧 upcoming deadline · 🟥 overdue deadline — based on Snag Date 4")
 
@@ -2047,8 +2062,7 @@ if not is_apartments:
         html += "</table>"
         st.markdown(html, unsafe_allow_html=True)
 
-if not is_apartments:
- with tab_sections:
+if _PAGE == "Sections" and not is_apartments:
     st.subheader("Section progress (WBHO subsections)")
     section_meter_type = st.radio("Meter type", ["All", "Water", "Electrical"], horizontal=True, key="sec_type")
     sec_df = df if section_meter_type == "All" else df[df["meter_type"] == section_meter_type]
@@ -2091,8 +2105,7 @@ st.caption("Reads the spreadsheet pushed into this repo folder. Push an updated 
 # =====================================================================
 # RETICULATION TAB — single-line diagram: Minisubs → Kiosks → Meters
 # =====================================================================
-if not is_apartments:
- with tab_retic:
+if _PAGE == "Reticulation" and not is_apartments:
     st.subheader("⚡ Electrical Reticulation — Single Line Diagram")
     st.caption("Supply → Minisub → Kiosk → Meters. Click a kiosk to expand stands. Click a stand chip to see its meter serial.")
 
@@ -2689,8 +2702,7 @@ if (highlightStands.size > 0) {{
 # =====================================================================
 # ESTATE MAP TAB
 # =====================================================================
-if not is_apartments:
- with tab_map:
+if _PAGE == "Estate Map" and not is_apartments:
     st.subheader("\U0001f5fa\ufe0f Estate Map \u2014 Installation Status")
 
     # Auto-load KML from repo folder, fall back to upload
@@ -2840,8 +2852,7 @@ if not is_apartments:
 # =====================================================================
 # FAULTY METERS TAB
 # =====================================================================
-if not is_apartments:
- with tab_faulty:
+if _PAGE == "Faulty Meters" and not is_apartments:
     st.subheader("⚠️ Faulty Meter Log")
     st.caption(
         "All meters flagged as faulty in the spreadsheet. "
@@ -2960,8 +2971,7 @@ if not is_apartments:
 # =====================================================================
 # AMR LIVE TAB
 # =====================================================================
-if not is_apartments:
- with tab_amr:
+if _PAGE == "AMR Live" and not is_apartments:
     st.subheader("📡 AMR Live — Meter Reading Status")
     st.caption(
         "Matches meter serials from your commissioning spreadsheet against the latest "
@@ -3429,8 +3439,7 @@ if not is_apartments:
 # =====================================================================
 # APARTMENT RETICULATION TAB — 3 levels: Minisub → Bulk → DBs → meters
 # =====================================================================
-if is_apartments and tab_aprt_retic is not None:
- with tab_aprt_retic:
+if _PAGE == "Reticulation" and is_apartments:
     st.subheader("🏢 Apartment Reticulation — Minisub → Bulk Meter → Distribution Boards")
     st.caption("Block A (Helderberg) is fed from Minisub 2; Block B (Tafelberg) from Minisub 1. "
                "Each block has a bulk check meter, feeding DB check meters, feeding apartment meters. "
@@ -3601,8 +3610,7 @@ data.forEach(b => {{
 # =====================================================================
 # APARTMENT INSTALLED TAB (when in apartment mode)
 # =====================================================================
-if is_apartments:
- with tab_installed:
+if _PAGE == "Installed" and is_apartments:
     st.subheader("🟩 Apartment meters — installed list")
     for mtype in sorted(df["meter_type"].unique()):
         sub = df[df["meter_type"]==mtype]
@@ -3616,7 +3624,7 @@ if is_apartments:
 # =====================================================================
 # BALANCING TAB — parent vs children consumption with losses
 # =====================================================================
-with tab_balance:
+if _PAGE == "Balancing":
     st.subheader("⚖️ Consumption Balancing — Electrical (kWh)")
     st.caption(
         "Compares each parent check meter's consumption against the sum of its children over the "
@@ -3884,8 +3892,7 @@ with tab_balance:
 # =====================================================================
 # APARTMENT FLOOR PLAN TAB — clickable Plotly schematic + AMR history
 # =====================================================================
-if is_apartments and tab_floorplan is not None:
- with tab_floorplan:
+if _PAGE == "AMR Live" and is_apartments:
     st.subheader("🏬 Block Floor Plans — AMR Import Status")
     st.caption(
         "Schematic per the architectural drawings: odd units north side, even south, three wings per "
@@ -4060,8 +4067,7 @@ if is_apartments and tab_floorplan is not None:
 # =====================================================================
 # STOCK TAB — inventory tracking with auto-deduction (freestanding)
 # =====================================================================
-if not is_apartments and tab_stock is not None:
- with tab_stock:
+if _PAGE == "Stock" and not is_apartments:
     st.subheader("📦 Stock on Hand — Freestanding Project")
     st.caption(
         "Stock counts auto-deduct from your commissioning spreadsheet: installations and faulty "
