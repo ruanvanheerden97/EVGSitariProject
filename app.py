@@ -709,6 +709,123 @@ def save_amr_cache(data):
 # =====================================================================
 # SHARED: stand history renderer (graphs + raw readings for a stand)
 # =====================================================================
+# ── Balancing visual helpers ──────────────────────────────────────────────────
+BAL_COLORS = {
+    "parent":  "#5B86B3",   # steel blue
+    "child":   "#2E7D52",   # green — measured children
+    "est":     "#8B5CF6",   # purple — estimated / unmetered
+    "loss_ok": "#3F7D5C",   # small technical loss
+    "loss_hi": "#BD4B2C",   # high loss — investigate
+    "anom":    "#E67E22",   # children exceed parent
+}
+
+
+def build_balance_sankey(parent_label, parent_val, children, est_val=0.0, height=320):
+    """
+    Energy-flow Sankey: parent → children (+ estimated + loss).
+    children: list of (label, value, kind) where kind ∈ {'child','est'}.
+    parent_val may be None → virtual parent (sum of children), labelled as such.
+    Returns a plotly Figure.
+    """
+    import plotly.graph_objects as go
+
+    kids = [(l, v, k) for l, v, k in children if v and v > 0.01]
+    child_sum = sum(v for _, v, _ in kids)
+    virtual = parent_val is None
+    p = child_sum + (est_val or 0) if virtual else parent_val
+
+    labels = [f"{parent_label}" + (" (virtual)" if virtual else "") + f"  {p:,.1f} kWh"]
+    node_colors = [BAL_COLORS["parent"]]
+    sources, targets, values, link_colors = [], [], [], []
+
+    for lbl, val, kind in kids:
+        labels.append(f"{lbl}  {val:,.1f}")
+        node_colors.append(BAL_COLORS["est"] if kind == "est" else BAL_COLORS["child"])
+        sources.append(0); targets.append(len(labels) - 1); values.append(val)
+        link_colors.append("rgba(139,92,246,.45)" if kind == "est" else "rgba(46,125,82,.45)")
+
+    if est_val and est_val > 0.01:
+        labels.append(f"Unmetered (est.)  {est_val:,.1f}")
+        node_colors.append(BAL_COLORS["est"])
+        sources.append(0); targets.append(len(labels) - 1); values.append(est_val)
+        link_colors.append("rgba(139,92,246,.55)")
+
+    if not virtual and p is not None:
+        residual = p - child_sum - (est_val or 0)
+        if residual > 0.01:
+            pct = residual / p * 100 if p else 0
+            lc = BAL_COLORS["loss_hi"] if pct > 10 else BAL_COLORS["loss_ok"]
+            labels.append(f"Loss  {residual:,.1f} ({pct:.1f}%)")
+            node_colors.append(lc)
+            sources.append(0); targets.append(len(labels) - 1); values.append(residual)
+            link_colors.append("rgba(189,75,44,.5)" if pct > 10 else "rgba(63,125,92,.35)")
+        elif residual < -0.01:
+            labels.append(f"⚠ Children exceed parent by {abs(residual):,.1f}")
+            node_colors.append(BAL_COLORS["anom"])
+            sources.append(0); targets.append(len(labels) - 1); values.append(0.01)
+            link_colors.append("rgba(230,126,34,.5)")
+
+    fig = go.Figure(go.Sankey(
+        arrangement="snap",
+        node=dict(label=labels, color=node_colors, pad=12, thickness=16,
+                  line=dict(color="#0e1117", width=0.5)),
+        link=dict(source=sources, target=targets, value=values, color=link_colors),
+    ))
+    fig.update_layout(
+        height=height, margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor="#0E1117", font=dict(color="#E0E0E0", size=11, family="monospace"),
+    )
+    return fig
+
+
+def build_db_bullet_chart(rows, unit="kWh", height_per_row=34):
+    """
+    Horizontal stacked bars: measured children (green) + estimate (purple) per DB,
+    with a diamond marker at the parent check-meter value.
+    rows: list of dicts {label, parent (float|None), measured, est, missing:int}
+    """
+    import plotly.graph_objects as go
+
+    labels   = [r["label"] for r in rows][::-1]
+    measured = [r["measured"] for r in rows][::-1]
+    ests     = [r["est"] for r in rows][::-1]
+    parents  = [r["parent"] for r in rows][::-1]
+    missing  = [r["missing"] for r in rows][::-1]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=labels, x=measured, orientation="h", name="Children measured",
+        marker_color=BAL_COLORS["child"],
+        hovertemplate="%{y}<br>Measured: %{x:,.1f} " + unit + "<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        y=labels, x=ests, orientation="h", name="Estimated (unmetered)",
+        marker_color=BAL_COLORS["est"],
+        customdata=missing,
+        hovertemplate="%{y}<br>Est.: %{x:,.1f} " + unit + " across %{customdata} meter(s)<extra></extra>",
+    ))
+    p_y = [l for l, p in zip(labels, parents) if p is not None]
+    p_x = [p for p in parents if p is not None]
+    if p_x:
+        fig.add_trace(go.Scatter(
+            y=p_y, x=p_x, mode="markers", name="Check meter (parent)",
+            marker=dict(symbol="diamond", size=11, color=BAL_COLORS["parent"],
+                        line=dict(color="#fff", width=1)),
+            hovertemplate="%{y}<br>Check meter: %{x:,.1f} " + unit + "<extra></extra>",
+        ))
+    fig.update_layout(
+        barmode="stack",
+        height=max(180, height_per_row * len(rows) + 90),
+        margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor="#0E1117", paper_bgcolor="#0E1117",
+        font=dict(color="#E0E0E0", size=11),
+        xaxis=dict(title=unit, gridcolor="#1E2D3D"),
+        yaxis=dict(gridcolor="#1E2D3D"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return fig
+
+
 def render_stand_history(stand, df_all, key_prefix="hist"):
     """Show usage charts + raw readings for every meter (all types) on a stand."""
     import plotly.graph_objects as go
@@ -2974,38 +3091,21 @@ if _PAGE == "Faulty Meters" and not is_apartments:
 if _PAGE == "AMR Live" and not is_apartments:
     st.subheader("📡 AMR Live — Meter Reading Status")
     st.caption(
-        "Matches meter serials from your commissioning spreadsheet against the latest "
-        "hourly CSV file on the SFTP server. Auto-refreshes every hour on the next page load."
+        "Live meter readings imported hourly from the automated collection system. "
+        "Matched against the commissioning spreadsheet per meter serial."
     )
 
-    # ── SFTP Configuration ────────────────────────────────────────────
-    with st.expander("⚙️ SFTP Configuration", expanded="sftp_configured" not in st.session_state):
-        st.markdown(
-            "Enter your SFTP credentials below, or add them to `.streamlit/secrets.toml` "
-            "on Streamlit Cloud so they're not stored in plain text.\n\n"
-            "```toml\n[sftp]\nhost = \"sftp.example.com\"\nport = 22\n"
-            "username = \"your_user\"\npassword = \"your_pass\"\n"
-            "directory = \"/path/to/csv/files\"\n```"
-        )
-
-        # Try to load from st.secrets first
-        try:
-            sftp_defaults = st.secrets.get("sftp", {})
-        except Exception:
-            sftp_defaults = {}
-
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            sftp_host = st.text_input("SFTP Host", value=sftp_defaults.get("host", ""), key="sftp_host")
-            sftp_user = st.text_input("Username",  value=sftp_defaults.get("username", ""), key="sftp_user")
-            sftp_dir  = st.text_input("Directory", value=sftp_defaults.get("directory", ""), placeholder="/data/readings", key="sftp_dir")
-        with sc2:
-            sftp_port = st.number_input("Port", value=int(sftp_defaults.get("port", 22)), min_value=1, max_value=65535, key="sftp_port")
-            sftp_pass = st.text_input("Password", value=sftp_defaults.get("password", ""), type="password", key="sftp_pass")
-
-        sftp_ready = all([sftp_host, sftp_user, sftp_pass, sftp_dir])
-        if sftp_ready:
-            st.session_state["sftp_configured"] = True
+    # ── SFTP settings — read silently from secrets (never shown on screen) ──
+    try:
+        _sftp_cfg = st.secrets.get("sftp", {})
+    except Exception:
+        _sftp_cfg = {}
+    sftp_host = _sftp_cfg.get("host", "")
+    sftp_user = _sftp_cfg.get("username", "")
+    sftp_pass = _sftp_cfg.get("password", "")
+    sftp_dir  = _sftp_cfg.get("directory", "")
+    sftp_port = int(_sftp_cfg.get("port", 22))
+    sftp_ready = all([sftp_host, sftp_user, sftp_pass, sftp_dir])
 
     # ── Load readings: SFTP or uploaded CSV ──────────────────────────
     amr_readings = {}
@@ -3013,11 +3113,12 @@ if _PAGE == "AMR Live" and not is_apartments:
     amr_file_ts  = None
     amr_error    = None
 
-    # Manual CSV upload as fallback / testing
-    uploaded_amr = st.file_uploader(
-        "Or upload a CSV file directly (for testing without SFTP)",
-        type=["csv"], key="amr_csv_upload"
-    )
+    # Manual CSV upload — admin fallback, tucked away
+    with st.expander("🛠️ Admin: manual CSV import", expanded=False):
+        uploaded_amr = st.file_uploader(
+            "Upload an AMR CSV file directly (fallback if the automated feed is down)",
+            type=["csv"], key="amr_csv_upload"
+        )
 
     # ── Auto-sync on startup ──────────────────────────────────────────
     # Runs once per browser session. Checks what the most recent file in
@@ -3627,21 +3728,18 @@ if _PAGE == "Installed" and is_apartments:
 if _PAGE == "Balancing":
     st.subheader("⚖️ Consumption Balancing — Electrical (kWh)")
     st.caption(
-        "Compares each parent check meter's consumption against the sum of its children over the "
-        "selected window. Meters without readings in the window are counted toward the unexplained "
-        "difference (losses) until their readings import."
+        "Energy-flow view of the whole site: each parent check meter compared against the sum of "
+        "its children over the selected window, with losses and estimates made visible."
     )
 
-    bal_c1, bal_c2 = st.columns([2.2, 1.4])
-    with bal_c1:
+    sel1, sel2 = st.columns([2.2, 1.4])
+    with sel1:
         bal_period = st.radio("Period", ["Last 24h", "Last 3 days", "Last 7 days", "Last 30 days"],
                               horizontal=True, key="bal_period")
-    with bal_c2:
+    with sel2:
         bal_tol = st.radio("Anchor tolerance", ["±1h", "±3h", "±6h"], index=1,
                            horizontal=True, key="bal_tol",
-                           help="Each meter's usage is measured between its readings closest to the "
-                                "same two anchor times (window start & end). This sets how far a "
-                                "reading may be from the anchor before the meter counts as unmetered.")
+                           help="Readings must fall within this window of both anchor times to count as measured.")
     _hours = {"Last 24h": 24, "Last 3 days": 72, "Last 7 days": 168, "Last 30 days": 720}[bal_period]
     _tol_h = {"±1h": 1, "±3h": 3, "±6h": 6}[bal_tol]
     _end   = datetime.now()
@@ -3651,84 +3749,28 @@ if _PAGE == "Balancing":
     if not cons:
         st.info("No consumption data in the selected window yet — the history DB fills up as hourly readings import.")
     else:
-        _spans = [c["span_hours"] for c in cons.values()]
-        st.caption(
-            f"Aligned window: **{_start.strftime('%d %b %H:%M')} → {_end.strftime('%d %b %H:%M')}** "
-            f"(anchors {bal_tol}) · **{len(cons)}** meters aligned · "
-            f"typical measured span {min(_spans):.0f}–{max(_spans):.0f}h"
-        )
+        spans = [c["span_hours"] for c in cons.values() if c.get("span_hours")]
+        avg_span = sum(spans) / len(spans) if spans else 0
+        st.caption(f"Window: **{_start.strftime('%d %b %H:%M')} → {_end.strftime('%d %b %H:%M')}** · "
+                   f"**{len(cons)}** meters aligned to anchors (avg span {avg_span:,.1f}h, tolerance {bal_tol})")
 
         def _delta(serial):
             c = cons.get(str(serial).strip())
             return c["delta"] if c else None
 
-        def _bal_row(label, parent_serial, child_sum, child_missing, indent=0):
-            """
-            One balancing line: parent vs measured children.
-            If the parent has a reading and some children don't, the residual
-            (parent − measured) is attributed to the unmetered children as an
-            ESTIMATE, clearly flagged, until real readings arrive.
-            """
-            pad = "&nbsp;" * (indent * 6)
-            p = _delta(parent_serial)
-            cols = st.columns([2.2, 1.1, 1.1, 1.3, 1.3, 1.6])
-            cols[0].markdown(f"{pad}**{label}**", unsafe_allow_html=True)
-            cols[1].markdown(f"Parent: **{p:,.1f}** kWh" if p is not None else "Parent: *no reading*")
-            cols[2].markdown(f"Measured: **{child_sum:,.1f}** kWh")
-
-            if p is None:
-                cols[3].markdown("Est.: —")
-                cols[4].markdown("Diff: *n/a*")
-                cols[5].caption(f"{child_missing} unmetered child meter(s)" if child_missing else "")
-                return
-
-            residual = p - child_sum
-            if child_missing > 0:
-                est = max(residual, 0.0)
-                cols[3].markdown(
-                    f"<span style='color:#8B5CF6;font-weight:700'>Est.: {est:,.1f} kWh</span>",
-                    unsafe_allow_html=True)
-                if residual >= 0:
-                    cols[4].markdown(
-                        "<span style='color:#2E7D52;font-weight:700'>0.0 kWh (est. applied)</span>",
-                        unsafe_allow_html=True)
-                    cols[5].caption(f"residual attributed to {child_missing} unmetered meter(s) "
-                                    f"(~{est/child_missing:,.1f} kWh each)")
-                else:
-                    pctl = (residual / p * 100) if p > 0 else 0
-                    cols[4].markdown(
-                        f"<span style='color:#BD4B2C;font-weight:700'>{residual:+,.1f} kWh ({pctl:+.1f}%)</span>",
-                        unsafe_allow_html=True)
-                    cols[5].caption(f"⚠ children exceed parent — check alignment / CT ratios "
-                                    f"({child_missing} unmetered)")
-            else:
-                loss = residual
-                pctl = (loss / p * 100) if p > 0 else 0
-                colr = "#BD4B2C" if pctl > 10 else "#E69138" if pctl > 3 else "#2E7D52"
-                cols[3].markdown("Est.: —")
-                cols[4].markdown(
-                    f"<span style='color:{colr};font-weight:700'>{loss:+,.1f} kWh ({pctl:+.1f}%)</span>",
-                    unsafe_allow_html=True)
-                cols[5].caption("technical losses" if abs(pctl) <= 10 else "high — investigate")
-
         # ── Load hierarchies ────────────────────────────────────────────
         fs_hier   = load_kiosk_data(data_path, mtime)
         aprt_hier = load_aprt_reticulation(data_path, mtime)
 
-        # FS elec serials per kiosk (freestanding data regardless of current view)
-        fs_df = load_data(data_path, mtime, "freestanding")
-        fs_elec = fs_df[fs_df["meter_type"] == "Electrical"]
-
-        # kiosk → stand serials from FS Elec sheet
         try:
             _xk = pd.ExcelFile(data_path)
             _en = find_sheet(_xk, ELEC_SHEET_CANDIDATES)
             _ek = _xk.parse(_en)
             _ek.columns = [str(c).strip() for c in _ek.columns]
-            _ek["kiosk"]  = _ek["Kiosk Number"].astype(str).str.strip()
-            _ek["ser"]    = _ek["Meter Serial"].apply(
-                lambda v: str(int(float(v))) if pd.notna(v) and str(v) not in ("nan","") else "")
-            kiosk_serials = _ek[_ek["ser"] != ""].groupby("kiosk")["ser"].apply(list).to_dict()
+            _ek["kiosk"] = _ek["Kiosk Number"].astype(str).str.strip()
+            _ek["ser"]   = _ek["Meter Serial"].apply(
+                lambda v: str(int(float(v))) if pd.notna(v) and str(v) not in ("nan", "") else "")
+            kiosk_serials    = _ek[_ek["ser"] != ""].groupby("kiosk")["ser"].apply(list).to_dict()
             kiosk_all_counts = _ek.groupby("kiosk")["Stand Number"].count().to_dict()
         except Exception:
             kiosk_serials, kiosk_all_counts = {}, {}
@@ -3738,155 +3780,193 @@ if _PAGE == "Balancing":
             if _be.get("minisub"):
                 MS_TO_BLOCK[str(_be["minisub"]["name"]).upper()] = _bn
 
-        # ── Level 1: Minisubs ──────────────────────────────────────────
-        st.markdown("#### Level 1 — Minisubs")
+        # ── Pre-compute per-minisub structures (shared by KPIs + visuals) ──
+        ms_view = []
         for ms_id in sorted(fs_hier.keys()):
             ms = fs_hier[ms_id]
             ms_serial = str(ms["serial"]).strip()
-            kiosk_sum, kiosk_missing, kiosk_details = 0.0, 0, []
+            ms_delta  = _delta(ms_serial)
+
+            kiosk_rows = []
+            kiosk_sum, kiosk_missing = 0.0, 0
             for k in ms["kiosks"]:
                 serials = kiosk_serials.get(k["kiosk"], [])
                 deltas  = [_delta(s) for s in serials]
                 have    = [d for d in deltas if d is not None]
                 ksum    = sum(have)
-                kmiss   = (kiosk_all_counts.get(k["kiosk"], len(serials))) - len(have)
+                kmiss   = max((kiosk_all_counts.get(k["kiosk"], len(serials))) - len(have), 0)
                 kiosk_sum += ksum
-                kiosk_missing += max(kmiss, 0)
-                kiosk_details.append((k["kiosk"], ksum, len(have), max(kmiss, 0)))
+                kiosk_missing += kmiss
+                kiosk_rows.append({"label": f"⚡ {k['kiosk']}", "value": ksum, "missing": kmiss})
 
-            # Apartment bulk under this minisub?
-            blk = MS_TO_BLOCK.get(f"MS{int(float(ms_id))}" if str(ms_id).replace('.','').isdigit() else str(ms_id).upper())
-            bulk_delta   = None
-            bulk_label   = ""
-            bulk_virtual = False
-            bulk_virtual_missing = 0
+            blk = MS_TO_BLOCK.get(f"MS{int(float(ms_id))}" if str(ms_id).replace('.', '').isdigit()
+                                  else str(ms_id).upper())
+            bulk_delta, bulk_virtual, bulk_v_missing = None, False, 0
             if blk and aprt_hier[blk].get("bulk"):
                 bs = aprt_hier[blk]["bulk"]["serial"]
                 bulk_delta = _delta(bs)
-                bulk_label = f"{blk} Bulk ({bs})"
                 if bulk_delta is None:
-                    # Virtual bulk: no reading from the physical bulk meter yet,
-                    # so use the sum of its child check meters (DBs + Lifts/UPS/Plant)
-                    # as a stand-in until AMR is installed on the bulk.
                     _e = aprt_hier[blk]
                     _vchecks = dict(_e["checks"])
                     for _dbn, _d in _e["dbs"].items():
-                        if _dbn not in _vchecks:
-                            _vchecks[_dbn] = {"serial": _d["check_serial"], "amr": _d["check_amr"]}
+                        _vchecks.setdefault(_dbn, {"serial": _d["check_serial"], "amr": _d["check_amr"]})
                     _vd = [_delta(c["serial"]) for c in _vchecks.values()]
                     _vh = [x for x in _vd if x is not None]
                     if _vh:
-                        bulk_delta = sum(_vh)
+                        bulk_delta   = sum(_vh)
                         bulk_virtual = True
-                        bulk_virtual_missing = len(_vd) - len(_vh)
-                        bulk_label = f"{blk} virtual bulk (Σ {len(_vh)} check meters)"
+                        bulk_v_missing = len(_vd) - len(_vh)
 
             children_total = kiosk_sum + (bulk_delta or 0)
-            if blk and bulk_delta is None:
-                miss_total = kiosk_missing + 1                       # bulk fully dark
-            elif bulk_virtual:
-                miss_total = kiosk_missing + bulk_virtual_missing    # partial virtual
+            miss_total = kiosk_missing + (bulk_v_missing if bulk_virtual
+                                          else (1 if (blk and bulk_delta is None) else 0))
+            est = max(ms_delta - children_total, 0.0) if (ms_delta is not None and miss_total > 0) else 0.0
+            loss = (ms_delta - children_total - est) if ms_delta is not None else None
+
+            ms_view.append({
+                "ms_id": ms_id, "serial": ms_serial, "delta": ms_delta,
+                "kiosks": kiosk_rows, "kiosk_missing": kiosk_missing,
+                "blk": blk, "bulk_delta": bulk_delta, "bulk_virtual": bulk_virtual,
+                "children_total": children_total, "miss_total": miss_total,
+                "est": est, "loss": loss,
+            })
+
+        # ── Site KPIs ──────────────────────────────────────────────────
+        total_parent   = sum(m["delta"] for m in ms_view if m["delta"] is not None)
+        total_children = sum(m["children_total"] for m in ms_view)
+        total_est      = sum(m["est"] for m in ms_view)
+        total_loss     = sum(m["loss"] for m in ms_view if m["loss"] is not None)
+        loss_pct       = (total_loss / total_parent * 100) if total_parent else 0
+        ms_measured_n  = sum(1 for m in ms_view if m["delta"] is not None)
+
+        metric_row([
+            ("🔌 Minisub intake", f"{total_parent:,.0f} kWh", f"{ms_measured_n}/{len(ms_view)} minisubs measured"),
+            ("✅ Metered downstream", f"{total_children:,.0f} kWh"),
+            ("🟣 Estimated (unmetered)", f"{total_est:,.0f} kWh",
+             f"{sum(m['miss_total'] for m in ms_view)} meters", "off"),
+            ("📉 Unexplained loss", f"{total_loss:,.0f} kWh",
+             f"{loss_pct:+.1f}%", "inverse" if loss_pct > 10 else "normal"),
+        ], desktop_cols=4)
+
+        st.divider()
+
+        # ── Level 1 — Minisub energy flow ───────────────────────────────
+        st.markdown("#### 🔌 Level 1 — Minisub energy flow")
+        for m in ms_view:
+            _ms_id, _delta_v = m["ms_id"], m["delta"]
+            if _delta_v is not None and _delta_v > 0:
+                _lp = (m["loss"] / _delta_v * 100) if m["loss"] is not None else 0
+                badge = "🟢" if _lp <= 3 else ("🟠" if _lp <= 10 else "🔴")
+                head = f"{badge} Minisub {_ms_id} — {_delta_v:,.1f} kWh in · loss {_lp:.1f}%"
+                if m["est"] > 0:
+                    head += f" · est. {m['est']:,.1f} kWh"
             else:
-                miss_total = kiosk_missing
+                head = f"⚫ Minisub {_ms_id} — no reading yet (children measured: {m['children_total']:,.1f} kWh)"
 
-            with st.expander(f"🔌 Minisub {ms_id} · serial {ms_serial}", expanded=False):
-                _bal_row(f"MS{ms_id} vs all children", ms_serial, children_total, miss_total)
-                if bulk_virtual:
-                    st.caption(
-                        f"ℹ️ {blk} bulk meter has no AMR reading yet — using the sum of its "
-                        f"check meters as a **virtual bulk**"
-                        + (f" ({bulk_virtual_missing} check meters also without readings)" if bulk_virtual_missing else "")
-                        + ". Replaced automatically once the bulk meter starts importing."
-                    )
-                # Per-child estimate share for the detail lines below
-                _ms_p = _delta(ms_serial)
-                _est_each = None
-                if _ms_p is not None and miss_total > 0:
-                    _est_total = max(_ms_p - children_total, 0.0)
-                    _est_each = _est_total / miss_total if miss_total else 0.0
-                st.markdown("---")
-                st.markdown("**Kiosks** (sum of stand meters per kiosk)")
-                for kname, ksum, khave, kmiss in kiosk_details:
-                    kc = st.columns([2, 1.4, 2])
-                    kc[0].caption(f"⚡ {kname}")
-                    kc[1].caption(f"{ksum:,.1f} kWh · {khave} meters")
-                    if kmiss and _est_each is not None:
-                        kc[2].caption(f"{kmiss} unmetered · est. ~{_est_each * kmiss:,.1f} kWh")
-                    else:
-                        kc[2].caption(f"{kmiss} without readings" if kmiss else "")
-                if bulk_label:
-                    bc = st.columns([2, 1.4, 2])
-                    bc[0].caption(f"🏢 {bulk_label}")
-                    bc[1].caption(f"{bulk_delta:,.1f} kWh" if bulk_delta is not None else "no reading")
-                    if bulk_virtual:
-                        bc[2].caption("virtual — Σ of check meters")
-                    elif bulk_delta is None and _est_each is not None:
-                        bc[2].caption(f"est. ~{_est_each:,.1f} kWh")
-                    else:
-                        bc[2].caption("" if bulk_delta is not None else "counted in losses")
+            with st.expander(head, expanded=False):
+                children = [(k["label"], k["value"], "child") for k in m["kiosks"] if k["value"] > 0]
+                if m["blk"] and m["bulk_delta"] is not None:
+                    kind = "est" if m["bulk_virtual"] else "child"
+                    lbl = f"🏢 {m['blk']}" + (" (virtual Σ)" if m["bulk_virtual"] else "")
+                    children.append((lbl, m["bulk_delta"], kind))
+                fig = build_balance_sankey(
+                    f"MS{_ms_id}", _delta_v, children, est_val=m["est"],
+                    height=280 if IS_MOBILE else 340)
+                st.plotly_chart(fig, use_container_width=True, key=f"bal_sankey_ms_{_ms_id}")
 
-        # ── Level 2 & 3: Apartment blocks ──────────────────────────────
-        st.markdown("#### Levels 2–3 — Apartment blocks")
+                notes = []
+                if m["bulk_virtual"]:
+                    notes.append(f"ℹ️ {m['blk']} bulk has no AMR yet — shown as the sum of its check meters (purple).")
+                if m["est"] > 0:
+                    notes.append(f"🟣 {m['est']:,.1f} kWh attributed to {m['miss_total']} unmetered meter(s) — "
+                                 "replaced by real readings as they come online.")
+                unmetered_kiosks = [k for k in m["kiosks"] if k["missing"]]
+                if unmetered_kiosks:
+                    notes.append("Unmetered per kiosk: " + " · ".join(
+                        f"{k['label'].replace('⚡ ', '')} ×{k['missing']}" for k in unmetered_kiosks))
+                if m["loss"] is not None and m["loss"] < -0.01:
+                    notes.append(f"🟠 Children exceed the minisub by {abs(m['loss']):,.1f} kWh — "
+                                 "check anchor alignment or CT ratios.")
+                for n in notes:
+                    st.caption(n)
+
+        st.divider()
+
+        # ── Levels 2–3 — Apartment blocks ───────────────────────────────
+        st.markdown("#### 🏢 Levels 2–3 — Apartment blocks")
         for blk in sorted((aprt_hier or {}).keys()):
             e = aprt_hier[blk]
             if not e.get("bulk"):
                 continue
             bulk_serial = e["bulk"]["serial"]
+            bulk_delta  = _delta(bulk_serial)
 
-            # Level 2: bulk vs ALL check meters under it — sub-DBs plus
-            # Lifts / UPS / Plant (they draw from the bulk too)
-            all_checks = dict(e["checks"])   # name → {serial, amr}
-            # DB groups whose check meter row is missing from the sheet still count
+            all_checks = dict(e["checks"])
             for dbn, d in e["dbs"].items():
-                if dbn not in all_checks:
-                    all_checks[dbn] = {"serial": d["check_serial"], "amr": d["check_amr"]}
+                all_checks.setdefault(dbn, {"serial": d["check_serial"], "amr": d["check_amr"]})
 
-            check_deltas, check_missing = [], 0
-            for cname, c in all_checks.items():
-                cd = _delta(c["serial"])
+            check_vals, check_missing = [], 0
+            for cname in sorted(all_checks.keys()):
+                cd = _delta(all_checks[cname]["serial"])
                 if cd is None:
                     check_missing += 1
                 else:
-                    check_deltas.append(cd)
+                    check_vals.append((cname, cd))
+            checks_sum = sum(v for _, v in check_vals)
+            b_est  = max(bulk_delta - checks_sum, 0.0) if (bulk_delta is not None and check_missing > 0) else 0.0
+            b_loss = (bulk_delta - checks_sum - b_est) if bulk_delta is not None else None
 
-            with st.expander(f"🏢 {blk} · bulk {bulk_serial}", expanded=False):
-                _bal_row(f"{blk} Bulk vs all check meters (DBs + Lifts/UPS/Plant)",
-                         bulk_serial, sum(check_deltas), check_missing)
-                st.markdown("---")
-                st.markdown("**Per check meter: usage, and vs child meters where allocated**")
+            if bulk_delta is not None:
+                _blp = (b_loss / bulk_delta * 100) if (b_loss is not None and bulk_delta) else 0
+                badge = "🟢" if _blp <= 3 else ("🟠" if _blp <= 10 else "🔴")
+                head = f"{badge} {blk} — bulk {bulk_delta:,.1f} kWh · loss {_blp:.1f}%"
+            else:
+                head = f"⚫ {blk} — bulk not on AMR yet (checks measured: {checks_sum:,.1f} kWh)"
+
+            with st.expander(head, expanded=False):
+                # Level 2 Sankey: bulk → every check meter
+                fig2 = build_balance_sankey(
+                    f"{blk} Bulk", bulk_delta,
+                    [(c, v, "child") for c, v in check_vals],
+                    est_val=b_est, height=300 if IS_MOBILE else 380)
+                st.plotly_chart(fig2, use_container_width=True, key=f"bal_sankey_{blk}")
+                if check_missing:
+                    st.caption(f"{check_missing} check meter(s) without aligned readings in this window.")
+
+                # Level 3 bullet chart: each DB check meter vs its children
+                st.markdown("**Per-DB: check meter (◆) vs apartment meters**")
+                rows = []
                 for cname in sorted(all_checks.keys()):
                     c = all_checks[cname]
+                    p = _delta(c["serial"])
                     d = e["dbs"].get(cname)
                     if d:
-                        # DB with allocated apartment meters → full balancing row
                         apt_deltas = [_delta(s) for s in d["serials"].values()]
                         apt_have   = [x for x in apt_deltas if x is not None]
-                        apt_miss   = len(apt_deltas) - len(apt_have)
-                        _bal_row(f"{cname} ({c['serial']})", c["serial"],
-                                 sum(apt_have), apt_miss, indent=1)
+                        measured   = sum(apt_have)
+                        n_missing  = len(apt_deltas) - len(apt_have)
+                        est = max(p - measured, 0.0) if (p is not None and n_missing > 0) else 0.0
+                        rows.append({"label": cname, "parent": p, "measured": measured,
+                                     "est": est, "missing": n_missing})
                     else:
-                        # Lift / UPS / Plant, or DB with no children yet → own usage only
-                        cd = _delta(c["serial"])
-                        cc = st.columns([2.2, 1.1, 1.1, 1.3, 1.3, 1.6])
-                        cc[0].markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**{cname}** ({c['serial']})",
-                                       unsafe_allow_html=True)
-                        cc[1].markdown(f"Usage: **{cd:,.1f}** kWh" if cd is not None else "Usage: *no reading*")
-                        cc[2].markdown("—")
-                        cc[3].markdown("—")
-                        cc[4].markdown("—")
-                        cc[5].caption("end-point load (no child meters)" if cd is not None
-                                      else "no child meters · no reading yet")
+                        rows.append({"label": f"{cname} (end-point)", "parent": p,
+                                     "measured": p or 0.0, "est": 0.0, "missing": 0})
+                if rows:
+                    fig3 = build_db_bullet_chart(rows)
+                    st.plotly_chart(fig3, use_container_width=True, key=f"bal_bullet_{blk}")
+                    st.caption("Bars: 🟩 measured apartment usage + 🟪 estimate for unmetered units · "
+                               "◆ diamond = the DB check meter's own measurement. "
+                               "Bar short of the diamond = loss within that DB. "
+                               "End-point loads (lifts, plant, UPS) show their own usage as the bar.")
 
         st.caption(
             "**Methodology** — Timestamp-aligned consumption: every meter's usage is measured between "
             "its readings closest to the same two anchor times (window start and end, within the "
             "selected tolerance), so parents and children are compared over the same physical period. "
             "Meters that can't be aligned count as unmetered. Where a parent has a reading but some "
-            "children don't, the positive residual (parent − measured children) is shown as an "
-            "**estimate** attributed to the unmetered meters — clearly flagged in purple — and is "
-            "replaced by real data automatically as those meters come online. A parent-less level "
-            "(e.g. a bulk meter without AMR) uses the sum of its children as a virtual parent until "
-            "its own readings arrive."
+            "children don't, the positive residual is shown in purple as an estimate attributed to the "
+            "unmetered meters and is replaced by real data as those meters come online. A parent "
+            "without AMR uses the sum of its children as a virtual parent until its readings arrive."
         )
 
 # =====================================================================
