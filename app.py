@@ -2318,9 +2318,12 @@ if _PAGE == "Reticulation" and not is_apartments:
     diagram_json = json.dumps(diagram_data)
     highlight_json = json.dumps(highlight_stands)
 
-    # Build faulty stand lookup for reticulation diagram
-    faulty_stands_set = set(df[df["faulty"]]["stand"].tolist()) if "faulty" in df.columns else set()
-    faulty_replaced_set = set(df[df["faulty"] & df["faulty_replaced"]]["stand"].tolist()) if "faulty" in df.columns else set()
+    # Build faulty stand lookup for the reticulation diagram.
+    # This is the ELECTRICAL reticulation — only electrical meter faults belong
+    # here. Water faults (tracked in FS Water) must not mark these stand chips.
+    _elec_df = df[df["meter_type"] == "Electrical"] if "meter_type" in df.columns else df
+    faulty_stands_set   = set(_elec_df[_elec_df["faulty"]]["stand"].tolist()) if "faulty" in _elec_df.columns else set()
+    faulty_replaced_set = set(_elec_df[_elec_df["faulty"] & _elec_df["faulty_replaced"]]["stand"].tolist()) if "faulty" in _elec_df.columns else set()
     faulty_json = json.dumps(list(faulty_stands_set))
     faulty_replaced_json = json.dumps(list(faulty_replaced_set))
 
