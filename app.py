@@ -876,7 +876,7 @@ def render_stand_history(stand, df_all, key_prefix="hist"):
                 plot_bgcolor="#0E1117", paper_bgcolor="#0E1117",
                 font=dict(color="#E0E0E0"), xaxis=dict(gridcolor="#1E2D3D"),
                 yaxis=dict(gridcolor="#1E2D3D"), height=340, margin=dict(t=60, b=20))
-            st.plotly_chart(fig, use_container_width=True,
+            st.plotly_chart(fig, width='stretch',
                             key=f"{key_prefix}_fig_{stand}_{mtype}")
         with t_raw:
             raw = hist_df[["reading_date","reading_value","low_battery","gap_hours"]].copy()
@@ -885,7 +885,7 @@ def render_stand_history(stand, df_all, key_prefix="hist"):
             raw["Low bat"]   = raw["Low bat"].map({1: "🔋", 0: ""})
             raw["Gap (h)"]   = raw["Gap (h)"].fillna(0).round(1)
             st.dataframe(raw.sort_values("Date/Time", ascending=False),
-                         use_container_width=True, hide_index=True, height=260)
+                         width='stretch', hide_index=True, height=260)
             rc = raw.to_csv(index=False).encode("utf-8")
             st.download_button(f"⬇️ {mtype} history", rc,
                 file_name=f"{stand}_{mtype.lower().replace(' ','_')}_history.csv",
@@ -1874,7 +1874,7 @@ def show_table(view_df, columns, rename, sort_col=None, ascending=True):
     for c in show.columns:
         if pd.api.types.is_datetime64_any_dtype(show[c]):
             show[c] = show[c].dt.strftime("%d %b %Y")
-    st.dataframe(show, use_container_width=True, hide_index=True)
+    st.dataframe(show, width='stretch', hide_index=True)
     csv = show.to_csv(index=False).encode("utf-8")
     # Use a hash of the CSV content to guarantee a unique key even when the
     # same table function is called multiple times with identical row counts.
@@ -1938,13 +1938,13 @@ else:
     hc1, hc2, hc3 = st.columns([1.3, 3, 1.3])
     with hc1:
         if _EVG_LOGO:
-            st.image(_EVG_LOGO, use_container_width=True)
+            st.image(_EVG_LOGO, width='stretch')
     with hc2:
         st.title("🔧 Sitari Evergreen — Meter Commissioning")
         st.caption("Erf 1186 Sitari · Lifestyle Retirement Village · managed by **Voltano Metering**")
     with hc3:
         if _VOL_LOGO:
-            st.image(_VOL_LOGO, use_container_width=True)
+            st.image(_VOL_LOGO, width='stretch')
 
 # Handle stand-click links from the apartment floor plan (query params).
 # Must run BEFORE the sidebar widgets so we can steer them.
@@ -2200,7 +2200,7 @@ if _PAGE == "Sections" and not is_apartments:
             "wbho_section": "Section", "total": "Total", "installed": "Installed",
             "deadline": "Deadline", "overdue": "Overdue", "progress": "% complete",
         }),
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         column_config={
             "% complete": st.column_config.ProgressColumn("% complete", min_value=0, max_value=100, format="%d%%"),
@@ -2213,7 +2213,7 @@ if _PAGE == "Sections" and not is_apartments:
     unit_summary["progress"] = (unit_summary["installed"] / unit_summary["total"] * 100).round(0)
     st.dataframe(
         unit_summary.rename(columns={"unit_type": "Unit type", "total": "Total", "installed": "Installed", "progress": "% complete"}),
-        use_container_width=True, hide_index=True,
+        width='stretch', hide_index=True,
         column_config={"% complete": st.column_config.ProgressColumn("% complete", min_value=0, max_value=100, format="%d%%")},
     )
 
@@ -3058,7 +3058,7 @@ if _PAGE == "Faulty Meters" and not is_apartments:
             ]
             display = display.sort_values(["Replacement status", "Stand"])
 
-            st.dataframe(display, use_container_width=True, hide_index=True,
+            st.dataframe(display, width='stretch', hide_index=True,
                          column_config={
                              "Replacement status": st.column_config.TextColumn("Status", width="medium"),
                          })
@@ -3423,13 +3423,13 @@ if _PAGE == "AMR Live" and not is_apartments:
                 })
             disp_df = pd.DataFrame(display_rows)
             st.caption(f"{len(view)} meters matching filters")
-            st.dataframe(disp_df,use_container_width=True,hide_index=True,height=300)
+            st.dataframe(disp_df,width='stretch',hide_index=True,height=300)
 
             if not amr_pending_df.empty:
                 with st.expander(f"🔧 AMR not yet fitted ({len(amr_pending_df)})"):
                     st.dataframe(amr_pending_df[["stand","meter_type","unit_type","wbho_section","serial"]].rename(
                         columns={"stand":"Stand","meter_type":"Type","unit_type":"Unit","wbho_section":"Section","serial":"Serial"}),
-                        use_container_width=True,hide_index=True)
+                        width='stretch',hide_index=True)
 
             import hashlib
             csv_out = disp_df.to_csv(index=False).encode("utf-8")
@@ -3719,7 +3719,7 @@ if _PAGE == "Installed" and is_apartments:
         with st.expander(f"**{mtype}** — {len(inst)}/{len(sub)} installed"):
             disp = inst[["stand","unit_type","wbho_section","serial","amr"]].rename(
                 columns={"stand":"Stand","unit_type":"Block","wbho_section":"DB/Block","serial":"Serial","amr":"AMR"})
-            st.dataframe(disp, use_container_width=True, hide_index=True)
+            st.dataframe(disp, width='stretch', hide_index=True)
 
 
 # =====================================================================
@@ -3732,18 +3732,49 @@ if _PAGE == "Balancing":
         "its children over the selected window, with losses and estimates made visible."
     )
 
-    sel1, sel2 = st.columns([2.2, 1.4])
-    with sel1:
-        bal_period = st.radio("Period", ["Last 24h", "Last 3 days", "Last 7 days", "Last 30 days"],
-                              horizontal=True, key="bal_period")
-    with sel2:
+    # ── Time selection: slider or date range, locked to available data ──
+    _, _, _db_min, _db_max = db_stats()
+    _now = datetime.now()
+    try:
+        _earliest = datetime.fromisoformat(_db_min) if _db_min else (_now - timedelta(days=30))
+    except Exception:
+        _earliest = _now - timedelta(days=30)
+    _max_days = max(1, min(365, int((_now - _earliest).total_seconds() // 86400) + 1))
+
+    selm, selt = st.columns([2.4, 1.4])
+    with selm:
+        bal_mode = st.radio("Time selection", ["🎚️ Quick slider", "📅 Date range"],
+                            horizontal=True, key="bal_mode")
+    with selt:
         bal_tol = st.radio("Anchor tolerance", ["±1h", "±3h", "±6h"], index=1,
                            horizontal=True, key="bal_tol",
                            help="Readings must fall within this window of both anchor times to count as measured.")
-    _hours = {"Last 24h": 24, "Last 3 days": 72, "Last 7 days": 168, "Last 30 days": 720}[bal_period]
     _tol_h = {"±1h": 1, "±3h": 3, "±6h": 6}[bal_tol]
-    _end   = datetime.now()
-    _start = _end - timedelta(hours=_hours)
+
+    if "slider" in bal_mode.lower():
+        _days_back = st.slider(
+            "Window — days back from now", 1, _max_days,
+            value=min(7, _max_days), key="bal_days",
+            help=f"Data available from {_earliest.strftime('%d %b %Y %H:%M')} — "
+                 f"the slider is capped there so the window never starts before the first reading.")
+        _start = max(_now - timedelta(days=_days_back), _earliest)
+        _end   = _now
+    else:
+        from datetime import time as _dtime
+        _dr = st.date_input(
+            "Period (start is locked to the first available reading)",
+            value=(max(_now - timedelta(days=7), _earliest).date(), _now.date()),
+            min_value=_earliest.date(), max_value=_now.date(),
+            key="bal_dates")
+        if isinstance(_dr, (list, tuple)) and len(_dr) == 2:
+            _d0, _d1 = _dr
+        elif isinstance(_dr, (list, tuple)) and len(_dr) == 1:
+            _d0 = _d1 = _dr[0]
+        else:
+            _d0 = _d1 = _dr
+        _start = max(datetime.combine(_d0, _dtime.min), _earliest)
+        _end   = min(datetime.combine(_d1, _dtime.max), _now)
+
     cons = db_get_consumption(_start.isoformat(), _end.isoformat(), _tol_h)
 
     if not cons:
@@ -3772,8 +3803,15 @@ if _PAGE == "Balancing":
                 lambda v: str(int(float(v))) if pd.notna(v) and str(v) not in ("nan", "") else "")
             kiosk_serials    = _ek[_ek["ser"] != ""].groupby("kiosk")["ser"].apply(list).to_dict()
             kiosk_all_counts = _ek.groupby("kiosk")["Stand Number"].count().to_dict()
+            _ek["stand_s"]   = _ek["Stand Number"].astype(str).str.strip()
+            kiosk_stand_serials = (
+                _ek[_ek["ser"] != ""]
+                .groupby("kiosk")[["stand_s", "ser"]]
+                .apply(lambda g: list(zip(g["stand_s"], g["ser"])))
+                .to_dict()
+            )
         except Exception:
-            kiosk_serials, kiosk_all_counts = {}, {}
+            kiosk_serials, kiosk_all_counts, kiosk_stand_serials = {}, {}, {}
 
         MS_TO_BLOCK = {}
         for _bn, _be in (aprt_hier or {}).items():
@@ -3850,6 +3888,136 @@ if _PAGE == "Balancing":
 
         st.divider()
 
+        # ── 📄 Consumption balance report generator ─────────────────────
+        st.markdown("#### 📄 Consumption balance report")
+        st.caption("Pick a Minisub or an apartment block and generate a full downstream "
+                   "breakdown for the selected window — every level's difference plus each "
+                   "individual meter, downloadable as CSV.")
+
+        _rep_opts = [f"Minisub {m['ms_id']}" for m in ms_view] + sorted((aprt_hier or {}).keys())
+        rc1, rc2 = st.columns([2.4, 1])
+        with rc1:
+            rep_scope = st.selectbox("Report scope", _rep_opts, key="bal_report_scope")
+        with rc2:
+            st.markdown("<div style='height:1.75em'></div>", unsafe_allow_html=True)
+            if st.button("🧾 Generate report", key="bal_report_btn"):
+                st.session_state["bal_report_go"] = rep_scope
+
+        def _block_report_rows(blk):
+            """Diff rows + meter rows for one apartment block."""
+            e = aprt_hier[blk]
+            bulk_serial = e["bulk"]["serial"]
+            bulk_d = _delta(bulk_serial)
+            all_checks = dict(e["checks"])
+            for dbn, d in e["dbs"].items():
+                all_checks.setdefault(dbn, {"serial": d["check_serial"], "amr": d["check_amr"]})
+
+            diff_rows, meter_rows = [], []
+            checks_sum, checks_missing = 0.0, 0
+            for cname in sorted(all_checks.keys()):
+                cd = _delta(all_checks[cname]["serial"])
+                meter_rows.append({"Section": f"{blk} · check meters", "Item": cname,
+                                   "Serial": all_checks[cname]["serial"],
+                                   "Consumption (kWh)": round(cd, 2) if cd is not None else None,
+                                   "Note": "" if cd is not None else "no aligned reading"})
+                if cd is None:
+                    checks_missing += 1
+                else:
+                    checks_sum += cd
+            _bd = bulk_d if bulk_d is not None else checks_sum
+            _best = max(bulk_d - checks_sum, 0.0) if (bulk_d is not None and checks_missing) else 0.0
+            diff_rows.append({
+                "Level": f"{blk} Bulk → check meters",
+                "Parent (kWh)": round(_bd, 2), "Children (kWh)": round(checks_sum, 2),
+                "Estimated (kWh)": round(_best, 2),
+                "Difference (kWh)": round(_bd - checks_sum - _best, 2),
+                "Diff %": round((_bd - checks_sum - _best) / _bd * 100, 2) if _bd else None,
+                "Unmetered": checks_missing,
+                "Note": "virtual bulk (Σ checks)" if bulk_d is None else "",
+            })
+            for cname in sorted(e["dbs"].keys()):
+                d = e["dbs"][cname]
+                p = _delta(d["check_serial"])
+                m_sum, m_miss = 0.0, 0
+                for stand, ser in sorted(d["serials"].items()):
+                    md = _delta(ser)
+                    meter_rows.append({"Section": f"{blk} · {cname}", "Item": stand, "Serial": ser,
+                                       "Consumption (kWh)": round(md, 2) if md is not None else None,
+                                       "Note": "" if md is not None else "no aligned reading"})
+                    if md is None:
+                        m_miss += 1
+                    else:
+                        m_sum += md
+                _e = max(p - m_sum, 0.0) if (p is not None and m_miss) else 0.0
+                diff_rows.append({
+                    "Level": f"{cname} → apartment meters",
+                    "Parent (kWh)": round(p, 2) if p is not None else None,
+                    "Children (kWh)": round(m_sum, 2), "Estimated (kWh)": round(_e, 2),
+                    "Difference (kWh)": round(p - m_sum - _e, 2) if p is not None else None,
+                    "Diff %": round((p - m_sum - _e) / p * 100, 2) if p else None,
+                    "Unmetered": m_miss,
+                    "Note": "" if p is not None else "check meter not aligned",
+                })
+            return diff_rows, meter_rows
+
+        if st.session_state.get("bal_report_go") == rep_scope:
+            diff_rows, meter_rows = [], []
+            if rep_scope.startswith("Minisub"):
+                _mid = rep_scope.replace("Minisub", "").strip()
+                m = next((x for x in ms_view if str(x["ms_id"]) == _mid), None)
+                if m:
+                    _p = m["delta"] if m["delta"] is not None else m["children_total"]
+                    diff_rows.append({
+                        "Level": f"MS{m['ms_id']} → kiosks + block bulk",
+                        "Parent (kWh)": round(_p, 2),
+                        "Children (kWh)": round(m["children_total"], 2),
+                        "Estimated (kWh)": round(m["est"], 2),
+                        "Difference (kWh)": round(m["loss"], 2) if m["loss"] is not None else None,
+                        "Diff %": round(m["loss"] / _p * 100, 2) if (m["loss"] is not None and _p) else None,
+                        "Unmetered": m["miss_total"],
+                        "Note": "MS meter not aligned — virtual (Σ children)" if m["delta"] is None else "",
+                    })
+                    for k in m["kiosks"]:
+                        kname = k["label"].replace("⚡ ", "")
+                        for stand, ser in kiosk_stand_serials.get(kname, []):
+                            md = _delta(ser)
+                            meter_rows.append({"Section": f"MS{m['ms_id']} · {kname}",
+                                               "Item": f"Stand {stand}", "Serial": ser,
+                                               "Consumption (kWh)": round(md, 2) if md is not None else None,
+                                               "Note": "" if md is not None else "no aligned reading"})
+                    # Downstream block, if this minisub feeds one
+                    if m["blk"]:
+                        bd, bm = _block_report_rows(m["blk"])
+                        diff_rows.extend(bd)
+                        meter_rows.extend(bm)
+            else:
+                diff_rows, meter_rows = _block_report_rows(rep_scope)
+
+            _diff_df  = pd.DataFrame(diff_rows)
+            _meter_df = pd.DataFrame(meter_rows)
+            _aligned_n = int(_meter_df["Consumption (kWh)"].notna().sum()) if not _meter_df.empty else 0
+
+            st.success(f"**{rep_scope}** · {_start.strftime('%d %b %Y %H:%M')} → "
+                       f"{_end.strftime('%d %b %Y %H:%M')} · tolerance {bal_tol} · "
+                       f"{_aligned_n}/{len(_meter_df)} meters aligned")
+            st.markdown("**Differences by level**")
+            st.dataframe(_diff_df, width='stretch', hide_index=True)
+            st.markdown("**Meter-level detail**")
+            st.dataframe(_meter_df, width='stretch', hide_index=True, height=320)
+
+            import hashlib as _hl_rep
+            _hdr = (f"Consumption balance report,{rep_scope}\n"
+                    f"Window,{_start.isoformat()} to {_end.isoformat()},Tolerance,{bal_tol}\n\n")
+            _csv = (_hdr + "DIFFERENCES BY LEVEL\n" + _diff_df.to_csv(index=False)
+                    + "\nMETER DETAIL\n" + _meter_df.to_csv(index=False)).encode("utf-8")
+            st.download_button(
+                "⬇️ Download report (CSV)", _csv,
+                file_name=f"balance_report_{rep_scope.replace(' ', '_')}_{_start.strftime('%Y%m%d')}-{_end.strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                key=f"bal_rep_dl_{_hl_rep.md5(_csv).hexdigest()[:8]}")
+
+        st.divider()
+
         # ── Level 1 — Minisub energy flow ───────────────────────────────
         st.markdown("#### 🔌 Level 1 — Minisub energy flow")
         for m in ms_view:
@@ -3872,7 +4040,7 @@ if _PAGE == "Balancing":
                 fig = build_balance_sankey(
                     f"MS{_ms_id}", _delta_v, children, est_val=m["est"],
                     height=280 if IS_MOBILE else 340)
-                st.plotly_chart(fig, use_container_width=True, key=f"bal_sankey_ms_{_ms_id}")
+                st.plotly_chart(fig, width='stretch', key=f"bal_sankey_ms_{_ms_id}")
 
                 notes = []
                 if m["bulk_virtual"]:
@@ -3929,7 +4097,7 @@ if _PAGE == "Balancing":
                     f"{blk} Bulk", bulk_delta,
                     [(c, v, "child") for c, v in check_vals],
                     est_val=b_est, height=300 if IS_MOBILE else 380)
-                st.plotly_chart(fig2, use_container_width=True, key=f"bal_sankey_{blk}")
+                st.plotly_chart(fig2, width='stretch', key=f"bal_sankey_{blk}")
                 if check_missing:
                     st.caption(f"{check_missing} check meter(s) without aligned readings in this window.")
 
@@ -3953,7 +4121,7 @@ if _PAGE == "Balancing":
                                      "measured": p or 0.0, "est": 0.0, "missing": 0})
                 if rows:
                     fig3 = build_db_bullet_chart(rows)
-                    st.plotly_chart(fig3, use_container_width=True, key=f"bal_bullet_{blk}")
+                    st.plotly_chart(fig3, width='stretch', key=f"bal_bullet_{blk}")
                     st.caption("Bars: 🟩 measured apartment usage + 🟪 estimate for unmetered units · "
                                "◆ diamond = the DB check meter's own measurement. "
                                "Bar short of the diamond = loss within that DB. "
@@ -4102,7 +4270,7 @@ if _PAGE == "AMR Live" and is_apartments:
             yaxis=dict(visible=False, range=[-0.8, len(floors_sorted) * 3 - 0.2]),
             showlegend=False, dragmode=False,
         )
-        ev = st.plotly_chart(fig, use_container_width=True,
+        ev = st.plotly_chart(fig, width='stretch',
                              on_select="rerun", selection_mode="points",
                              key=f"fp_plot_{blk}")
         try:
