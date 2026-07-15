@@ -841,9 +841,22 @@ def render_stand_history(stand, df_all, key_prefix="hist"):
         serial = r["serial"]
         mtype  = r["meter_type"]
         unit   = "kWh" if mtype == "Electrical" else "Litres"
+        old_serial = str(r.get("old_serial", "") or "")
+        if old_serial and old_serial not in ("nan", "None"):
+            st.caption(f"🔁 **{mtype}** meter was replaced — showing new meter `{serial}` "
+                       f"(previous meter `{old_serial}` below).")
         hist_df = db_get_history(serial)
         if hist_df.empty:
-            st.caption(f"**{mtype}** · serial `{serial}` — no readings in history yet.")
+            st.caption(f"**{mtype}** · serial `{serial}` — no readings in history yet"
+                       + (" (new meter — history builds up from its first import)." if old_serial and old_serial not in ("nan","None") else "."))
+            if old_serial and old_serial not in ("nan", "None"):
+                _old_hist = db_get_history(old_serial)
+                if not _old_hist.empty:
+                    with st.expander(f"📜 Previous {mtype} meter `{old_serial}` — {len(_old_hist)} readings"):
+                        _od = _old_hist.copy()
+                        _od["reading_date"] = _od["reading_date"].dt.strftime("%d %b %Y %H:%M")
+                        st.dataframe(_od.sort_values("reading_date", ascending=False),
+                                     width='stretch', hide_index=True, height=240)
             continue
         hist_df = hist_df.copy()
         hist_df["consumption"] = hist_df["reading_value"].diff().clip(lower=0)
@@ -890,6 +903,16 @@ def render_stand_history(stand, df_all, key_prefix="hist"):
             st.download_button(f"⬇️ {mtype} history", rc,
                 file_name=f"{stand}_{mtype.lower().replace(' ','_')}_history.csv",
                 key=f"{key_prefix}_dl_{stand}_{mtype}_{_hl.md5(rc).hexdigest()[:6]}")
+
+        # Previous meter (replaced) — its readings remain in the DB under the old serial
+        if old_serial and old_serial not in ("nan", "None"):
+            _old_hist = db_get_history(old_serial)
+            if not _old_hist.empty:
+                with st.expander(f"📜 Previous {mtype} meter `{old_serial}` — {len(_old_hist)} readings (before replacement)"):
+                    _od = _old_hist.copy()
+                    _od["reading_date"] = _od["reading_date"].dt.strftime("%d %b %Y %H:%M")
+                    st.dataframe(_od.sort_values("reading_date", ascending=False),
+                                 width='stretch', hide_index=True, height=240)
 
 
 def amr_status_info(reading_date_iso):
@@ -955,6 +978,23 @@ def load_data(file_path, _mtime, site_type="freestanding"):
         out["faulty"] = coalesce_col(wdf, ["Faulty Meter"]).fillna(False).astype(bool)
         out["faulty_replaced"] = coalesce_col(wdf, ["Faulty Replaced"]).fillna(False).astype(bool)
         out["replacement_date"] = pd.to_datetime(coalesce_col(wdf, ["Replacement Date"]), errors="coerce")
+
+        # Replacement meter serial: flexible column match — any header containing
+        # 'serial' plus 'replacement'/'new'. When Faulty Replaced is ticked and a
+        # replacement serial is present, it becomes the ACTIVE serial (used for
+        # AMR matching, maps, history); the original moves to old_serial.
+        _repl_col = next(
+            (c for c in wdf.columns
+             if "serial" in c.lower() and ("replace" in c.lower() or "new" in c.lower())),
+            None)
+        out["old_serial"] = ""
+        if _repl_col:
+            _repl = fmt_serial(wdf[_repl_col])
+            _use  = out["faulty_replaced"] & (_repl.str.len() > 0)
+            out.loc[_use, "old_serial"] = out.loc[_use, "serial"]
+            out.loc[_use, "serial"]     = _repl[_use]
+
+        out["eb_port"] = ""
         out["meter_type"] = "Water"
         out = out[out["stand"].notna() & (out["stand"] != "") & (out["stand"].str.lower() != "none")]
         records.append(out)
@@ -975,6 +1015,35 @@ def load_data(file_path, _mtime, site_type="freestanding"):
         out["faulty"] = coalesce_col(edf, ["Faulty Meter"]).fillna(False).astype(bool)
         out["faulty_replaced"] = coalesce_col(edf, ["Faulty Replaced"]).fillna(False).astype(bool)
         out["replacement_date"] = pd.to_datetime(coalesce_col(edf, ["Replacement Date"]), errors="coerce")
+        # EB Port: AMR device port allocated to this meter. A port number with
+        # AMR Installed=False means the AMR is wired but the meter is still OFF
+        # (building site, power not on) — no import expected yet.
+        _eb_col = next((c for c in edf.columns
+                        if "eb" in c.lower() and "port" in c.lower()), None)
+        if _eb_col:
+            def _fmt_port(v):
+                if pd.isna(v):
+                    return ""
+                s = str(v).strip()
+                if s in ("", "nan", "None"):
+                    return ""
+                try:
+                    return str(int(float(s)))   # 3.0 → "3"
+                except (ValueError, TypeError):
+                    return s                     # e.g. "P3" stays as-is
+            out["eb_port"] = edf[_eb_col].apply(_fmt_port)
+        else:
+            out["eb_port"] = ""
+        _repl_col_e = next(
+            (c for c in edf.columns
+             if "serial" in c.lower() and ("replace" in c.lower() or "new" in c.lower())),
+            None)
+        out["old_serial"] = ""
+        if _repl_col_e:
+            _repl_e = fmt_serial(edf[_repl_col_e])
+            _use_e  = out["faulty_replaced"] & (_repl_e.str.len() > 0)
+            out.loc[_use_e, "old_serial"] = out.loc[_use_e, "serial"]
+            out.loc[_use_e, "serial"]     = _repl_e[_use_e]
         out["meter_type"] = "Electrical"
         out = out[out["stand"].notna() & (out["stand"] != "") & (out["stand"].str.lower() != "none")]
         records.append(out)
@@ -1032,7 +1101,24 @@ def _load_apartment_data(xls):
         out["deadline"]       = pd.NaT
         out["faulty"]         = False
         out["faulty_replaced"]= False
+        out["old_serial"]     = ""
         out["replacement_date"]= pd.NaT
+        _eb_col_a = next((c for c in edf.columns
+                          if "eb" in c.lower() and "port" in c.lower()), None)
+        if _eb_col_a:
+            def _fmt_port_a(v):
+                if pd.isna(v):
+                    return ""
+                s = str(v).strip()
+                if s in ("", "nan", "None"):
+                    return ""
+                try:
+                    return str(int(float(s)))
+                except (ValueError, TypeError):
+                    return s
+            out["eb_port"] = edf[_eb_col_a].apply(_fmt_port_a)
+        else:
+            out["eb_port"] = ""
         out["meter_type"]     = "Electrical"
         out["installed"]      = out["serial"].str.len().gt(0) & out["serial"].ne("nan")
         out = out[out["stand"].notna() & (out["stand"] != "") & (out["stand"].str.lower() != "nan")]
@@ -1061,7 +1147,9 @@ def _load_apartment_data(xls):
             out["deadline"]        = pd.NaT
             out["faulty"]          = False
             out["faulty_replaced"] = False
+            out["old_serial"]      = ""
             out["replacement_date"]= pd.NaT
+            out["eb_port"]         = ""
             out["meter_type"]      = meter_subtype
             out["installed"]       = out["serial"].str.len().gt(0) & out["serial"].ne("nan")
             out = out[out["stand"].notna() & (out["stand"] != "") & (out["stand"].str.lower() != "nan")]
@@ -1731,6 +1819,8 @@ def build_amr_map(polygons, kiosks, df, amr_readings, faulty_df, center):
         "amr-orange": "#E67E22",
         "amr-red":    "#BD4B2C",
         "amr-never":  "#607080",
+        "meter-off":  "#2F4B7C",   # AMR wired (EB port), meter switched off
+        "no-amr":     "#3A4454",   # no AMR device fitted
     }
 
     for poly in polygons:
@@ -1746,11 +1836,17 @@ def build_amr_map(polygons, kiosks, df, amr_readings, faulty_df, center):
         last_reading_str = "—"
         last_value_str   = "—"
         last_serial      = "—"
+        any_amr_live     = False
+        any_eb_port      = False
 
         for _, r in rows.iterrows():
             serial = r.get("serial", "")
             if not serial:
                 continue
+            if bool(r.get("amr", False)):
+                any_amr_live = True
+            if str(r.get("eb_port", "") or "").strip() not in ("", "nan", "None"):
+                any_eb_port = True
             reading = amr_readings.get(serial)
             rd_iso  = reading["reading_date"] if reading else None
             _, _, badge = amr_status_info(rd_iso)
@@ -1763,6 +1859,21 @@ def build_amr_map(polygons, kiosks, df, amr_readings, faulty_df, center):
                 val   = reading["reading_value"]
                 last_value_str = f"{val:,.1f} {'L' if mtype=='Water' else 'kWh'}"
             last_serial = serial
+
+        # If no meter on this stand is AMR-live and nothing has ever imported,
+        # distinguish "wired but off" (EB port assigned) from "AMR not fitted".
+        meter_state_note = ""
+        if best_badge == "amr-never" and not any_amr_live:
+            if any_eb_port:
+                best_badge = "meter-off"
+                meter_state_note = ("<div style='margin:4px 0;padding:3px 8px;background:#2F4B7C22;"
+                                    "color:#7FA3D8;border:1px solid #2F4B7C88;border-radius:5px;"
+                                    "font-size:11px;font-weight:700'>🔌 Meter off — AMR wired, power not on</div>")
+            else:
+                best_badge = "no-amr"
+                meter_state_note = ("<div style='margin:4px 0;padding:3px 8px;background:#3A445422;"
+                                    "color:#8A97A8;border:1px solid #3A445488;border-radius:5px;"
+                                    "font-size:11px;font-weight:700'>🔧 AMR not fitted yet</div>")
 
         color   = amr_colors.get(best_badge, "#607080")
         is_faulty_pending = stand in faulty_pending_stands
@@ -1780,6 +1891,7 @@ def build_amr_map(polygons, kiosks, df, amr_readings, faulty_df, center):
             f"<div style='display:inline-block;padding:2px 9px;border-radius:8px;font-size:11px;"
             f"font-weight:600;background:{color}22;color:{color};border:1px solid {color}88;margin-bottom:6px'>"
             f"{amr_status_info(amr_readings.get(last_serial,{}).get('reading_date') if last_serial != '—' else None)[0]}</div>"
+            f"{meter_state_note}"
             f"{faulty_note}"
             f"<table style='font-size:11px;width:100%;border-collapse:collapse'>"
             f"<tr><td style='color:#777;padding:2px 4px'>Last reading</td><td style='padding:2px 4px'>{last_reading_str}</td></tr>"
@@ -3297,13 +3409,19 @@ if _PAGE == "AMR Live" and not is_apartments:
     else:
         st.divider()
 
-        # ── Split: AMR installed vs not installed ─────────────────────
-        # Only meters where amr=True are expected to import.
-        # Meters with amr=False have no AMR device fitted yet.
+        # ── Split: AMR installed vs wired-but-off vs not fitted ────────
+        # amr=True                      → live, import expected
+        # amr=False + EB port assigned  → AMR wired, meter still OFF (no import expected)
+        # amr=False + no EB port        → AMR device not fitted yet
         all_installed = df[df["installed"] & df["serial"].str.len().gt(0)].copy()
         all_installed = all_installed.drop_duplicates(subset=["stand", "meter_type"])
+        if "eb_port" not in all_installed.columns:
+            all_installed["eb_port"] = ""
+        all_installed["eb_port"] = all_installed["eb_port"].fillna("").astype(str)
         amr_installed_df = all_installed[all_installed["amr"] == True]
-        amr_pending_df   = all_installed[all_installed["amr"] == False]
+        _not_live        = all_installed[all_installed["amr"] == False]
+        meter_off_df     = _not_live[_not_live["eb_port"].str.len() > 0]
+        amr_pending_df   = _not_live[_not_live["eb_port"].str.len() == 0]
 
         rows = []
         for _, r in amr_installed_df.iterrows():
@@ -3342,7 +3460,8 @@ if _PAGE == "AMR Live" and not is_apartments:
             ("🟠 4–7d",  len(orange), f"{round(len(orange)/total_amr_inst*100) if total_amr_inst else 0}%"),
             ("🔴 7d+",   len(red),    f"{round(len(red)/total_amr_inst*100) if total_amr_inst else 0}%"),
             ("⚫ Never",  len(never),  f"{round(len(never)/total_amr_inst*100) if total_amr_inst else 0}%"),
-            ("🔧 AMR pending", len(amr_pending_df), "meter in, AMR not fitted"),
+            ("🔌 Meter off", len(meter_off_df), "AMR wired, power not on", "off"),
+            ("🔧 AMR not fitted", len(amr_pending_df), "no AMR device yet"),
         ])
 
         # ── Per-type summary rows (Electricity / Water / Hot Water separately) ──
@@ -3350,6 +3469,7 @@ if _PAGE == "AMR Live" and not is_apartments:
         for _tname in sorted(amr_table["meter_type"].unique().tolist()):
             _tsub  = amr_table[amr_table["meter_type"] == _tname]
             _tpend = amr_pending_df[amr_pending_df["meter_type"] == _tname]
+            _toff  = meter_off_df[meter_off_df["meter_type"] == _tname]
             _tcnt  = _tsub["status_badge"].value_counts()
             _ttot  = len(_tsub)
             _tg    = int(_tcnt.get("amr-green", 0))
@@ -3360,7 +3480,8 @@ if _PAGE == "AMR Live" and not is_apartments:
                 ("🟠 4–7d",  int(_tcnt.get("amr-orange", 0))),
                 ("🔴 7d+",   int(_tcnt.get("amr-red", 0))),
                 ("⚫ Never", int(_tcnt.get("amr-never", 0))),
-                ("🔧 Pending", len(_tpend)),
+                ("🔌 Off", len(_toff)),
+                ("🔧 Not fitted", len(_tpend)),
             ])
 
         low_bat_meters   = amr_table[amr_table["low_battery"]==1]
@@ -3427,6 +3548,16 @@ if _PAGE == "AMR Live" and not is_apartments:
             disp_df = pd.DataFrame(display_rows)
             st.caption(f"{len(view)} meters matching filters")
             st.dataframe(disp_df,width='stretch',hide_index=True,height=300)
+
+            if not meter_off_df.empty:
+                with st.expander(f"🔌 Meter off — AMR wired, power not on ({len(meter_off_df)})"):
+                    st.caption("These meters have an EB port allocated on the kiosk AMR device, "
+                               "but the meter is still switched off (building site). No import is "
+                               "expected until the power goes on — tick **AMR Installed** in the "
+                               "sheet once it's live.")
+                    st.dataframe(meter_off_df[["stand","meter_type","unit_type","wbho_section","serial","eb_port"]].rename(
+                        columns={"stand":"Stand","meter_type":"Type","unit_type":"Unit","wbho_section":"Section","serial":"Serial","eb_port":"EB Port"}),
+                        width='stretch',hide_index=True)
 
             if not amr_pending_df.empty:
                 with st.expander(f"🔧 AMR not yet fitted ({len(amr_pending_df)})"):
@@ -3502,7 +3633,9 @@ if _PAGE == "AMR Live" and not is_apartments:
                         render_cached_map(amr_map_html, height=380 if IS_MOBILE else 500)
                 leg = "<div style='display:flex;flex-wrap:wrap;gap:10px;font-size:11px;margin-top:4px'>"
                 for col,lbl in [("#2E7D52","🟢 <24h"),("#D4AC0D","🟡 1–3d"),("#E67E22","🟠 4–7d"),
-                                 ("#BD4B2C","🔴 7d+"),("#607080","⚫ Never"),("#EF4444","⚠️ Faulty")]:
+                                 ("#BD4B2C","🔴 7d+"),("#607080","⚫ AMR live, never seen"),
+                                 ("#2F4B7C","🔌 Meter off (AMR wired)"),("#3A4454","🔧 AMR not fitted"),
+                                 ("#EF4444","⚠️ Faulty")]:
                     leg += (f"<span><span style='display:inline-block;width:11px;height:11px;border-radius:2px;"
                             f"background:{col};vertical-align:middle;margin-right:3px'></span>{lbl}</span>")
                 leg += "</div>"
@@ -4195,6 +4328,7 @@ if _PAGE == "AMR Live" and is_apartments:
     _fp_df = df[df["meter_type"] == fp_type]
     serial_by_stand   = dict(zip(_fp_df["stand"], _fp_df["serial"]))
     amr_flag_by_stand = dict(zip(_fp_df["stand"], _fp_df["amr"]))
+    eb_port_by_stand  = dict(zip(_fp_df["stand"], _fp_df.get("eb_port", pd.Series([""] * len(_fp_df))).fillna("").astype(str)))
 
     import re as _re_fp
     import plotly.graph_objects as _go_fp
@@ -4214,7 +4348,11 @@ if _PAGE == "AMR Live" and is_apartments:
         rd_iso  = reading.get("reading_date") if reading else None
         label, color, badge = amr_status_info(rd_iso)
         if not amr_fitted:
-            color, label = "#33415c", "AMR not fitted"
+            _ebp = str(eb_port_by_stand.get(stand, "") or "").strip()
+            if _ebp and _ebp not in ("nan", "None"):
+                color, label = "#2F4B7C", f"Meter off — AMR wired (EB port {_ebp})"
+            else:
+                color, label = "#33415c", "AMR not fitted"
         blocks_fp.setdefault(blk, {}).setdefault(floor, []).append({
             "unit": unit, "unit_str": m.group(3), "stand": stand,
             "serial": serial, "color": color, "label": label,
@@ -4288,6 +4426,7 @@ if _PAGE == "AMR Live" and is_apartments:
         "<div style='display:flex;flex-wrap:wrap;gap:14px;font-size:11px'>"
         "<span>🟩 &lt;24h</span><span>🟨 1–3d</span><span>🟧 4–7d</span><span>🟥 7d+</span>"
         "<span><span style='display:inline-block;width:11px;height:11px;background:#607080;border-radius:2px'></span> AMR fitted, never seen</span>"
+        "<span><span style='display:inline-block;width:11px;height:11px;background:#2F4B7C;border-radius:2px'></span> Meter off (AMR wired)</span>"
         "<span><span style='display:inline-block;width:11px;height:11px;background:#33415c;border-radius:2px'></span> AMR not fitted</span>"
         "<span><span style='display:inline-block;width:11px;height:11px;outline:2px solid #FFF176;outline-offset:-2px;border-radius:2px'></span> Low battery</span>"
         "</div>", unsafe_allow_html=True)
