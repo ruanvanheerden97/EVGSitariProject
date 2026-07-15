@@ -3654,8 +3654,51 @@ if _PAGE == "AMR Live" and not is_apartments:
                     _amr_polygons,_amr_kiosks,_ = parse_kml(_kml_data)
                 except Exception: pass
 
+            # Shared: legend + history section (used by both map paths)
+            _amr_legend_html = "<div style='display:flex;flex-wrap:wrap;gap:10px;font-size:11px;margin-top:4px'>"
+            for _lc, _ll in [("#2E7D52","🟢 <24h"),("#D4AC0D","🟡 1–3d"),("#E67E22","🟠 4–7d"),
+                             ("#BD4B2C","🔴 7d+"),("#607080","⚫ AMR live, never seen"),
+                             ("#2F4B7C","🔌 Meter off (AMR wired)"),("#3A4454","🔧 AMR not fitted"),
+                             ("#EF4444","⚠️ Faulty")]:
+                _amr_legend_html += (f"<span><span style='display:inline-block;width:11px;height:11px;border-radius:2px;"
+                                     f"background:{_lc};vertical-align:middle;margin-right:3px'></span>{_ll}</span>")
+            _amr_legend_html += "</div>"
+
+            def _render_amr_history():
+                st.markdown("##### Stand reading history — water & electricity")
+                _hist_pool = df[df["installed"] & df["serial"].str.len().gt(0)]
+                stand_options = sorted(_hist_pool["stand"].unique().tolist())
+                # A widget key set from a map click must exist in options, else drop it
+                if st.session_state.get("amr_stand_select") not in stand_options:
+                    st.session_state.pop("amr_stand_select", None)
+                default_stand = st.session_state.get("amr_selected_stand",
+                                                     stand_options[0] if stand_options else None)
+                if default_stand not in stand_options and stand_options:
+                    default_stand = stand_options[0]
+
+                sel_col, info_col = st.columns([1, 2.4])
+                with sel_col:
+                    selected_stand = st.selectbox(
+                        "Select stand (auto-set when you click the map)",
+                        options=stand_options,
+                        index=stand_options.index(default_stand) if default_stand in stand_options else 0,
+                        key="amr_stand_select")
+                    if selected_stand:
+                        st.session_state["amr_selected_stand"] = selected_stand
+                with info_col:
+                    total_rows_db, _, mn, mx = db_stats()
+                    st.caption(f"History DB: **{total_rows_db:,}** readings · "
+                               f"{mn[:10] if mn else '—'} → {mx[:10] if mx else '—'}"
+                               + (" · ⚠️ Faulty meter on this stand" if selected_stand in faulty_pending_stands else ""))
+
+                if selected_stand:
+                    render_stand_history(selected_stand, df, key_prefix="amr")
+                st.caption("Auto-refreshes hourly. History stored permanently in Supabase.")
+
             if not _amr_polygons:
                 st.info("No KML found — push `EVG_Sitari.kml` to see the map.")
+                st.divider()
+                _render_amr_history()
             else:
                 _amr_map_df = df.copy() if len(a_type) == len(_types_present) else df[df["meter_type"].isin(a_type)]
                 _center = kml_center(_amr_polygons,_amr_kiosks,[])
@@ -3704,16 +3747,40 @@ if _PAGE == "AMR Live" and not is_apartments:
                     _kmh = str(sorted((k, len(v), sum(x["amr"] for x in v)) for k, v in kiosk_meters_map.items()))
                     with st.spinner("Building map…"):
                         _mobj = _cached_amr_map_obj(_gh, _dh, _ah, _fph, _kmh)
-                        map_ret = st_folium(_mobj, use_container_width=True, height=380 if IS_MOBILE else 500,
-                                            returned_objects=["last_object_clicked_popup"],
-                                            key="amr_click_map")
-                    _clicked = (map_ret or {}).get("last_object_clicked_popup") or ""
-                    if _clicked:
-                        import re as _re_click
-                        _mm = _re_click.search(r"Stand ID:\s*(\w+)", str(_clicked))
-                        if _mm:
-                            st.session_state["amr_selected_stand"] = _mm.group(1)
-                    st.caption("💡 Click any stand polygon to open its water & electricity graphs below.")
+
+                    # Fragment: clicks rerun ONLY this section — the rest of the
+                    # page stays put, and we feed the last zoom/centre back into
+                    # the map so it never jumps back to the initial view.
+                    @st.fragment
+                    def _amr_map_and_history():
+                        _view = st.session_state.get("amr_map_view", {})
+                        map_ret = st_folium(
+                            _mobj, use_container_width=True,
+                            height=380 if IS_MOBILE else 500,
+                            center=_view.get("center"), zoom=_view.get("zoom"),
+                            returned_objects=["last_object_clicked_popup", "zoom", "center"],
+                            key="amr_click_map")
+                        if map_ret:
+                            _z = map_ret.get("zoom")
+                            _c = map_ret.get("center")
+                            if isinstance(_c, dict) and "lat" in _c:
+                                _c = (_c["lat"], _c.get("lng", _c.get("lon")))
+                            if _z or _c:
+                                st.session_state["amr_map_view"] = {"zoom": _z, "center": _c}
+                        _clicked = (map_ret or {}).get("last_object_clicked_popup") or ""
+                        if _clicked:
+                            import re as _re_click
+                            _mm = _re_click.search(r"Stand ID:\s*(\w+)", str(_clicked))
+                            if _mm:
+                                st.session_state["amr_selected_stand"] = _mm.group(1)
+                                st.session_state["amr_stand_select"]   = _mm.group(1)
+                        st.caption("💡 Click a stand for its graphs, or a kiosk for its meter list — "
+                                   "the map keeps its position and only this section refreshes.")
+                        st.markdown(_amr_legend_html, unsafe_allow_html=True)
+                        st.divider()
+                        _render_amr_history()
+
+                    _amr_map_and_history()
                 else:
                     _gh = _poly_hash(_amr_polygons,_amr_kiosks)
                     _dh = _df_hash(_amr_map_df)
@@ -3723,47 +3790,9 @@ if _PAGE == "AMR Live" and not is_apartments:
                         amr_map_html = cached_amr_map_html(_gh,_dh,_ah,_fph,_center,
                             _amr_polygons,_amr_kiosks,_amr_map_df,amr_readings,faulty_pending_df)
                         render_cached_map(amr_map_html, height=380 if IS_MOBILE else 500)
-                leg = "<div style='display:flex;flex-wrap:wrap;gap:10px;font-size:11px;margin-top:4px'>"
-                for col,lbl in [("#2E7D52","🟢 <24h"),("#D4AC0D","🟡 1–3d"),("#E67E22","🟠 4–7d"),
-                                 ("#BD4B2C","🔴 7d+"),("#607080","⚫ AMR live, never seen"),
-                                 ("#2F4B7C","🔌 Meter off (AMR wired)"),("#3A4454","🔧 AMR not fitted"),
-                                 ("#EF4444","⚠️ Faulty")]:
-                    leg += (f"<span><span style='display:inline-block;width:11px;height:11px;border-radius:2px;"
-                            f"background:{col};vertical-align:middle;margin-right:3px'></span>{lbl}</span>")
-                leg += "</div>"
-                st.markdown(leg,unsafe_allow_html=True)
-
-        st.divider()
-
-        # ── Stand history (full width) ─────────────────────────────────
-        st.markdown("##### Stand reading history — water & electricity")
-        # All stands with any serial (not only AMR-commissioned), so any map click resolves
-        _hist_pool = df[df["installed"] & df["serial"].str.len().gt(0)]
-        stand_options = sorted(_hist_pool["stand"].unique().tolist())
-        default_stand = st.session_state.get("amr_selected_stand",
-                                             stand_options[0] if stand_options else None)
-        if default_stand not in stand_options and stand_options:
-            default_stand = stand_options[0]
-
-        sel_col, info_col = st.columns([1, 2.4])
-        with sel_col:
-            selected_stand = st.selectbox(
-                "Select stand (auto-set when you click the map)",
-                options=stand_options,
-                index=stand_options.index(default_stand) if default_stand in stand_options else 0,
-                key="amr_stand_select")
-            if selected_stand:
-                st.session_state["amr_selected_stand"] = selected_stand
-        with info_col:
-            total_rows_db, _, mn, mx = db_stats()
-            st.caption(f"History DB: **{total_rows_db:,}** readings · "
-                       f"{mn[:10] if mn else '—'} → {mx[:10] if mx else '—'}"
-                       + (" · ⚠️ Faulty meter on this stand" if selected_stand in faulty_pending_stands else ""))
-
-        if selected_stand:
-            render_stand_history(selected_stand, df, key_prefix="amr")
-
-        st.caption("Auto-refreshes hourly. History stored permanently in Supabase.")
+                    st.markdown(_amr_legend_html, unsafe_allow_html=True)
+                    st.divider()
+                    _render_amr_history()
 
 # =====================================================================
 # APARTMENT RETICULATION TAB — 3 levels: Minisub → Bulk → DBs → meters
