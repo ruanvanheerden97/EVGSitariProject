@@ -1806,6 +1806,148 @@ def kml_center(polygons, kiosks, minisubs):
     return [-34.054, 18.778]   # Sitari estate fallback
 
 
+def build_amr_plotly_map(polygons, kiosks, df, amr_readings, faulty_stands,
+                         kiosk_meters, center, height=500):
+    """
+    Plotly satellite map for AMR status. Unlike the folium round-trip, Plotly's
+    uirevision keeps the user's pan/zoom through Streamlit reruns — clicking a
+    stand never resets the view. Stands are clickable centroid markers coloured
+    by AMR state; kiosks are diamonds whose hover lists every connected meter.
+    """
+    import plotly.graph_objects as go
+
+    AMR_COLORS = {
+        "amr-green": "#2E7D52", "amr-yellow": "#D4AC0D", "amr-orange": "#E67E22",
+        "amr-red": "#BD4B2C", "amr-never": "#607080",
+        "meter-off": "#2F4B7C", "no-amr": "#3A4454",
+    }
+    badge_priority = ["amr-green", "amr-yellow", "amr-orange", "amr-red", "amr-never"]
+
+    # Polygon outlines (context) — one trace, all boundaries
+    line_lats, line_lons = [], []
+    for poly in polygons:
+        for la, lo in poly["coords"]:
+            line_lats.append(la); line_lons.append(lo)
+        la0, lo0 = poly["coords"][0]
+        line_lats.append(la0); line_lons.append(lo0)
+        line_lats.append(None); line_lons.append(None)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scattermap(
+        lat=line_lats, lon=line_lons, mode="lines",
+        line=dict(color="rgba(255,255,255,0.55)", width=1),
+        hoverinfo="skip", showlegend=False))
+
+    # Stand centroids — clickable, coloured by AMR state
+    s_lat, s_lon, s_col, s_txt, s_custom, s_hover, s_lcol, s_lw = [], [], [], [], [], [], [], []
+    for poly in polygons:
+        stand = poly["name"].strip()
+        rows = df[df["stand"] == stand]
+        if rows.empty:
+            continue
+        best = "amr-never"; any_live = False; any_eb = False
+        last_rd, last_val = "\u2014", "\u2014"
+        for _, r in rows.iterrows():
+            serial = r.get("serial", "")
+            if not serial:
+                continue
+            if bool(r.get("amr", False)):
+                any_live = True
+            if str(r.get("eb_port", "") or "").strip() not in ("", "nan", "None"):
+                any_eb = True
+            rd = amr_readings.get(serial)
+            rd_iso = rd["reading_date"] if rd else None
+            _, _, badge = amr_status_info(rd_iso)
+            if badge_priority.index(badge) < badge_priority.index(best):
+                best = badge
+            if rd_iso and str(rd_iso) not in ("nan", "None", ""):
+                last_rd = str(rd_iso)[:16].replace("T", " ")
+            if rd and rd.get("reading_value") is not None:
+                unit = "kWh" if r.get("meter_type") == "Electrical" else "L"
+                _rv = rd['reading_value']
+                last_val = f"{_rv:,.1f} {unit}"
+        state_note = ""
+        if best == "amr-never" and not any_live:
+            best = "meter-off" if any_eb else "no-amr"
+            state_note = ("\U0001F50C Meter off \u2014 AMR wired" if any_eb
+                          else "\U0001F527 AMR not fitted")
+        la = sum(p[0] for p in poly["coords"]) / len(poly["coords"])
+        lo = sum(p[1] for p in poly["coords"]) / len(poly["coords"])
+        s_lat.append(la); s_lon.append(lo)
+        s_col.append(AMR_COLORS[best])
+        s_txt.append(stand)
+        s_custom.append(["stand", stand])
+        is_flt = stand in faulty_stands
+        s_lcol.append("#EF4444" if is_flt else "rgba(0,0,0,0.55)")
+        s_lw.append(2.5 if is_flt else 1)
+        hover = (f"<b>Stand {stand}</b><br>Last reading: {last_rd}<br>Value: {last_val}"
+                 + (f"<br>{state_note}" if state_note else "")
+                 + ("<br>\u26a0\ufe0f Faulty \u2014 awaiting replacement" if is_flt else "")
+                 + "<br><i>Click for graphs \u2193</i>")
+        s_hover.append(hover)
+
+    fig.add_trace(go.Scattermap(
+        lat=s_lat, lon=s_lon, mode="markers+text",
+        marker=dict(size=16, color=s_col),
+        text=s_txt, textfont=dict(size=8, color="white"),
+        textposition="middle center",
+        customdata=s_custom, hovertext=s_hover,
+        hovertemplate="%{hovertext}<extra></extra>", showlegend=False))
+
+    # Kiosks — diamonds; hover lists connected meters
+    k_lat, k_lon, k_hover, k_custom = [], [], [], []
+    for k in kiosks:
+        kname = k["name"].strip()
+        mts = (kiosk_meters or {}).get(kname, [])
+        n_live = sum(1 for m in mts if m.get("amr"))
+        n_off  = sum(1 for m in mts if not m.get("amr")
+                     and str(m.get("eb_port", "")).strip() not in ("", "nan", "None"))
+        n_none = len(mts) - n_live - n_off
+        lines = [f"<b>\u26a1 Kiosk {kname}</b>",
+                 f"{len(mts)} meters \u00b7 \U0001F7E2 {n_live} live \u00b7 \U0001F50C {n_off} off \u00b7 \U0001F527 {n_none} no AMR", ""]
+        for m in mts[:14]:
+            if m.get("amr"):
+                rd = amr_readings.get(m.get("serial", ""))
+                lbl, _, _ = amr_status_info(rd.get("reading_date") if rd else None)
+                dot = "\U0001F7E2" if rd else "\u26ab"
+                state = lbl
+            elif str(m.get("eb_port", "")).strip() not in ("", "nan", "None"):
+                _ebv = m['eb_port']
+                dot, state = "\U0001F50C", f"off \u00b7 EB {_ebv}"
+            else:
+                dot, state = "\U0001F527", "no AMR"
+            _ms = m['stand']; _mse = m['serial']
+            lines.append(f"{dot} {_ms} \u00b7 {_mse} \u00b7 {state}")
+        if len(mts) > 14:
+            lines.append(f"\u2026 +{len(mts)-14} more")
+        k_lat.append(k["lat"]); k_lon.append(k["lon"])
+        k_hover.append("<br>".join(lines))
+        k_custom.append(["kiosk", kname])
+
+    fig.add_trace(go.Scattermap(
+        lat=k_lat, lon=k_lon, mode="markers+text",
+        marker=dict(size=14, color="#E69138", symbol="circle"),
+        text=[k["name"].strip() for k in kiosks],
+        textfont=dict(size=9, color="#E69138"),
+        textposition="top right",
+        customdata=k_custom, hovertext=k_hover,
+        hovertemplate="%{hovertext}<extra></extra>", showlegend=False))
+
+    fig.update_layout(
+        map=dict(
+            style="white-bg",
+            layers=[dict(below="traces", sourcetype="raster",
+                         sourceattribution="Esri World Imagery",
+                         source=["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"])],
+            center=dict(lat=center[0], lon=center[1]), zoom=16.6,
+        ),
+        uirevision="amr_map_view",     # ← preserves pan/zoom across ALL reruns
+        height=height, margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor="#0E1117", showlegend=False,
+    )
+    return fig
+
+
 def build_amr_map(polygons, kiosks, df, amr_readings, faulty_df, center, kiosk_meters=None):
     """
     Folium map coloured by AMR import status.
@@ -3735,18 +3877,12 @@ if _PAGE == "AMR Live" and not is_apartments:
                     except Exception:
                         kiosk_meters_map = {}
 
-                    @st.cache_resource(show_spinner=False)
-                    def _cached_amr_map_obj(geom_h, df_h, amr_h, f_h, km_h):
-                        return build_amr_map(_amr_polygons, _amr_kiosks, _amr_map_df,
-                                             amr_readings, faulty_pending_df, _center,
-                                             kiosk_meters=kiosk_meters_map)
-                    _gh = _poly_hash(_amr_polygons,_amr_kiosks)
-                    _dh = _df_hash(_amr_map_df)
-                    _ah = _amr_hash(amr_readings)
-                    _fph = str(sorted(faulty_pending_df["stand"].tolist())) if not faulty_pending_df.empty else ""
-                    _kmh = str(sorted((k, len(v), sum(x["amr"] for x in v)) for k, v in kiosk_meters_map.items()))
                     with st.spinner("Building map…"):
-                        _mobj = _cached_amr_map_obj(_gh, _dh, _ah, _fph, _kmh)
+                        _amr_fig = build_amr_plotly_map(
+                            _amr_polygons, _amr_kiosks, _amr_map_df,
+                            amr_readings, faulty_pending_stands,
+                            kiosk_meters_map, _center,
+                            height=380 if IS_MOBILE else 520)
 
                     # Fragment: clicks rerun ONLY this section. The map component's
                     # props are completely static (same cached map object, same key,
@@ -3755,20 +3891,22 @@ if _PAGE == "AMR Live" and not is_apartments:
                     # and pans/zooms don't trigger reruns at all (only popup clicks do).
                     @st.fragment
                     def _amr_map_and_history():
-                        map_ret = st_folium(
-                            _mobj, use_container_width=True,
-                            height=380 if IS_MOBILE else 500,
-                            returned_objects=["last_object_clicked_popup"],
-                            key="amr_click_map")
-                        _clicked = (map_ret or {}).get("last_object_clicked_popup") or ""
-                        if _clicked:
-                            import re as _re_click
-                            _mm = _re_click.search(r"Stand ID:\s*(\w+)", str(_clicked))
-                            if _mm:
-                                st.session_state["amr_selected_stand"] = _mm.group(1)
-                                st.session_state["amr_stand_select"]   = _mm.group(1)
-                        st.caption("💡 Click a stand for its graphs, or a kiosk for its meter list — "
-                                   "the map keeps its position and only this section refreshes.")
+                        ev = st.plotly_chart(
+                            _amr_fig, width='stretch',
+                            on_select="rerun", selection_mode="points",
+                            config={"scrollZoom": True},
+                            key="amr_plotly_map")
+                        try:
+                            pts = ev.selection.points if ev and ev.selection else []
+                        except Exception:
+                            pts = []
+                        if pts:
+                            _cd = pts[0].get("customdata") or []
+                            if len(_cd) == 2 and _cd[0] == "stand":
+                                st.session_state["amr_selected_stand"] = _cd[1]
+                                st.session_state["amr_stand_select"]   = _cd[1]
+                        st.caption("💡 Click a stand for its graphs · hover a kiosk for its full meter list — "
+                                   "the map keeps your position; pan and zoom freely.")
                         st.markdown(_amr_legend_html, unsafe_allow_html=True)
                         st.divider()
                         _render_amr_history()
