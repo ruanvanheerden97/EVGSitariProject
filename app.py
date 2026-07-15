@@ -40,11 +40,12 @@ IS_MOBILE = st.session_state["is_mobile"]
 def metric_row(items, desktop_cols=None):
     """
     Render a row of st.metric tiles that adapts to screen size:
-    all in one row on desktop, chunked 2-per-row on mobile.
+    max 4 per row on desktop (wrapping into extra rows), 2 per row on mobile.
+    The cap keeps tiles wide enough that labels and values never truncate.
     items: list of tuples (label, value) or (label, value, delta) or
            (label, value, delta, delta_color).
     """
-    per_row = 2 if IS_MOBILE else (desktop_cols or len(items))
+    per_row = 2 if IS_MOBILE else min(desktop_cols or len(items), 4)
     for i in range(0, len(items), per_row):
         chunk = items[i:i + per_row]
         cols = st.columns(per_row)
@@ -63,23 +64,36 @@ st.markdown("""
   background: #FBF9F3 !important;
   border: 1px solid #DCD6C4;
   border-radius: 10px;
-  padding: 10px 14px;
+  padding: 7px 10px;
 }
 div[data-testid="stMetric"] * {
   color: #152B45 !important;
 }
 div[data-testid="stMetricLabel"], div[data-testid="stMetricLabel"] * {
-  font-size: 12px !important;
+  font-size: 11px !important;
   text-transform: uppercase;
-  letter-spacing: .05em;
+  letter-spacing: .03em;
   color: #3E5066 !important;
+  white-space: normal !important;      /* wrap instead of truncating */
+  overflow: visible !important;
+  text-overflow: clip !important;
+  line-height: 1.25 !important;
 }
 div[data-testid="stMetricValue"], div[data-testid="stMetricValue"] * {
   color: #152B45 !important;
+  font-size: 1.45rem !important;       /* compact value — fits narrow tiles */
+  line-height: 1.15 !important;
+  white-space: normal !important;
+  overflow: visible !important;
 }
 div[data-testid="stMetricDelta"], div[data-testid="stMetricDelta"] * {
   color: #3F7D5C !important;
   fill: #3F7D5C !important;
+  font-size: 11px !important;
+  white-space: normal !important;      /* long delta notes wrap too */
+  overflow: visible !important;
+  text-overflow: clip !important;
+  line-height: 1.2 !important;
 }
 h1, h2, h3 {color: #152B45;}
 
@@ -1792,11 +1806,14 @@ def kml_center(polygons, kiosks, minisubs):
     return [-34.054, 18.778]   # Sitari estate fallback
 
 
-def build_amr_map(polygons, kiosks, df, amr_readings, faulty_df, center):
+def build_amr_map(polygons, kiosks, df, amr_readings, faulty_df, center, kiosk_meters=None):
     """
     Folium map coloured by AMR import status.
     amr_readings: dict of serial → {reading_date, reading_value, ...}
     faulty_df:    DataFrame of faulty-but-not-replaced meters (stand column)
+    kiosk_meters: optional dict kiosk_name → list of {stand, serial, eb_port, amr}
+                  — when given, kiosk markers get a clickable popup listing every
+                  connected meter with its AMR state.
     """
     from datetime import datetime as _dt
     m = folium.Map(location=center, zoom_start=19, tiles=None, max_zoom=22)
@@ -1926,10 +1943,54 @@ def build_amr_map(polygons, kiosks, df, amr_readings, faulty_df, center):
     # Kiosk markers (lightweight)
     for k in kiosks:
         kname = k["name"].strip()
+        _meters = (kiosk_meters or {}).get(kname, [])
+
+        if _meters:
+            n_live = n_off = n_none = 0
+            rows_html = ""
+            for mt in _meters:
+                _amr  = bool(mt.get("amr"))
+                _ebp  = str(mt.get("eb_port", "") or "").strip()
+                _ser  = mt.get("serial", "")
+                _rd   = amr_readings.get(_ser)
+                if _amr:
+                    n_live += 1
+                    _lbl, _col, _ = amr_status_info(_rd.get("reading_date") if _rd else None)
+                    _state = _lbl
+                elif _ebp and _ebp not in ("nan", "None"):
+                    n_off += 1
+                    _col, _state = "#2F4B7C", "Meter off — AMR wired"
+                else:
+                    n_none += 1
+                    _col, _state = "#3A4454", "AMR not fitted"
+                _port_s = f" · EB {_ebp}" if _ebp and _ebp not in ("nan", "None") else ""
+                rows_html += (
+                    f"<tr>"
+                    f"<td style='padding:2px 4px'><span style='display:inline-block;width:9px;height:9px;"
+                    f"border-radius:50%;background:{_col}'></span></td>"
+                    f"<td style='padding:2px 4px;font-weight:600'>{mt.get('stand','')}</td>"
+                    f"<td style='padding:2px 4px;font-family:monospace;font-size:10px'>{_ser}</td>"
+                    f"<td style='padding:2px 4px;color:#555;font-size:10px'>{_state}{_port_s}</td>"
+                    f"</tr>")
+            popup_html = (
+                f"<div style='font-family:sans-serif;min-width:250px'>"
+                f"<div style='font-size:13px;font-weight:700;color:#152B45'>⚡ Kiosk {kname}</div>"
+                f"<div style='font-size:10px;color:#666;margin:3px 0 6px'>"
+                f"{len(_meters)} meters · 🟢 {n_live} live · 🔌 {n_off} off · 🔧 {n_none} no AMR</div>"
+                f"<div style='max-height:230px;overflow-y:auto'>"
+                f"<table style='font-size:11px;border-collapse:collapse;width:100%'>{rows_html}</table>"
+                f"</div></div>")
+            popup = folium.Popup(popup_html, max_width=330)
+        else:
+            popup = None
+
         folium.CircleMarker(
             location=[k["lat"], k["lon"]], radius=8,
             color="#B96E1E", fill=True, fill_color="#E69138", fill_opacity=0.95, weight=2,
-            tooltip=folium.Tooltip(f"<b>\u26a1 {kname}</b>", sticky=True),
+            tooltip=folium.Tooltip(f"<b>\u26a1 {kname}</b>" +
+                                   (f"<br><span style='font-size:10px'>{len(_meters)} meters — click for AMR status</span>" if _meters else ""),
+                                   sticky=True),
+            popup=popup,
         ).add_to(m)
         folium.Marker(
             location=[k["lat"], k["lon"]],
@@ -3602,16 +3663,47 @@ if _PAGE == "AMR Live" and not is_apartments:
                 if not is_apartments:
                     # Clickable map: st_folium returns the clicked popup so a stand
                     # click auto-opens its history below. Map object cached by resource.
+                    # Kiosk → connected elec meters (stand, serial, EB port, AMR state)
+                    try:
+                        _kx = pd.ExcelFile(data_path)
+                        _ken = find_sheet(_kx, ELEC_SHEET_CANDIDATES)
+                        _ke = _kx.parse(_ken)
+                        _ke.columns = [str(c).strip() for c in _ke.columns]
+                        _ke = _ke[_ke["Kiosk Number"].notna()].copy()
+                        _ke["kiosk"] = _ke["Kiosk Number"].astype(str).str.strip()
+                        _ke["stand"] = _ke["Stand Number"].astype(str).str.strip()
+                        _ke["ser"]   = _ke["Meter Serial"].apply(
+                            lambda v: str(int(float(v))) if pd.notna(v) and str(v) not in ("nan","") else "")
+                        _ke["amrf"]  = _ke["AMR Installed"].fillna(False).astype(bool)
+                        _keb = next((c for c in _ke.columns
+                                     if "eb" in c.lower() and "port" in c.lower()), None)
+                        if _keb:
+                            _ke["ebp"] = _ke[_keb].apply(
+                                lambda v: "" if pd.isna(v) or str(v).strip() in ("","nan","None")
+                                else (str(int(float(v))) if str(v).replace(".","",1).replace("-","",1).isdigit() else str(v).strip()))
+                        else:
+                            _ke["ebp"] = ""
+                        kiosk_meters_map = {
+                            kn: [{"stand": r["stand"], "serial": r["ser"],
+                                  "eb_port": r["ebp"], "amr": bool(r["amrf"])}
+                                 for _, r in grp.iterrows() if r["ser"]]
+                            for kn, grp in _ke.groupby("kiosk")
+                        }
+                    except Exception:
+                        kiosk_meters_map = {}
+
                     @st.cache_resource(show_spinner=False)
-                    def _cached_amr_map_obj(geom_h, df_h, amr_h, f_h):
+                    def _cached_amr_map_obj(geom_h, df_h, amr_h, f_h, km_h):
                         return build_amr_map(_amr_polygons, _amr_kiosks, _amr_map_df,
-                                             amr_readings, faulty_pending_df, _center)
+                                             amr_readings, faulty_pending_df, _center,
+                                             kiosk_meters=kiosk_meters_map)
                     _gh = _poly_hash(_amr_polygons,_amr_kiosks)
                     _dh = _df_hash(_amr_map_df)
                     _ah = _amr_hash(amr_readings)
                     _fph = str(sorted(faulty_pending_df["stand"].tolist())) if not faulty_pending_df.empty else ""
+                    _kmh = str(sorted((k, len(v), sum(x["amr"] for x in v)) for k, v in kiosk_meters_map.items()))
                     with st.spinner("Building map…"):
-                        _mobj = _cached_amr_map_obj(_gh, _dh, _ah, _fph)
+                        _mobj = _cached_amr_map_obj(_gh, _dh, _ah, _fph, _kmh)
                         map_ret = st_folium(_mobj, use_container_width=True, height=380 if IS_MOBILE else 500,
                                             returned_objects=["last_object_clicked_popup"],
                                             key="amr_click_map")
