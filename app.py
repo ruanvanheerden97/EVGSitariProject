@@ -3748,25 +3748,18 @@ if _PAGE == "AMR Live" and not is_apartments:
                     with st.spinner("Building map…"):
                         _mobj = _cached_amr_map_obj(_gh, _dh, _ah, _fph, _kmh)
 
-                    # Fragment: clicks rerun ONLY this section — the rest of the
-                    # page stays put, and we feed the last zoom/centre back into
-                    # the map so it never jumps back to the initial view.
+                    # Fragment: clicks rerun ONLY this section. The map component's
+                    # props are completely static (same cached map object, same key,
+                    # no dynamic center/zoom), so Streamlit keeps the same map
+                    # instance mounted across reruns — position and zoom persist,
+                    # and pans/zooms don't trigger reruns at all (only popup clicks do).
                     @st.fragment
                     def _amr_map_and_history():
-                        _view = st.session_state.get("amr_map_view", {})
                         map_ret = st_folium(
                             _mobj, use_container_width=True,
                             height=380 if IS_MOBILE else 500,
-                            center=_view.get("center"), zoom=_view.get("zoom"),
-                            returned_objects=["last_object_clicked_popup", "zoom", "center"],
+                            returned_objects=["last_object_clicked_popup"],
                             key="amr_click_map")
-                        if map_ret:
-                            _z = map_ret.get("zoom")
-                            _c = map_ret.get("center")
-                            if isinstance(_c, dict) and "lat" in _c:
-                                _c = (_c["lat"], _c.get("lng", _c.get("lon")))
-                            if _z or _c:
-                                st.session_state["amr_map_view"] = {"zoom": _z, "center": _c}
                         _clicked = (map_ret or {}).get("last_object_clicked_popup") or ""
                         if _clicked:
                             import re as _re_click
