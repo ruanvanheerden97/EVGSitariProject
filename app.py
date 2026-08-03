@@ -1009,6 +1009,9 @@ def load_data(file_path, _mtime, site_type="freestanding"):
             out.loc[_use, "serial"]     = _repl[_use]
 
         out["eb_port"] = ""
+        out["handover_date"]   = pd.to_datetime(coalesce_col(wdf, ["Handover Date"]), errors="coerce")
+        out["closing_reading"] = coalesce_col(wdf, ["Closing Reading"]).apply(
+            lambda v: str(v).strip() if pd.notna(v) and str(v).strip() not in ("", "nan", "None") else "")
         out["meter_type"] = "Water"
         out = out[out["stand"].notna() & (out["stand"] != "") & (out["stand"].str.lower() != "none")]
         records.append(out)
@@ -1058,6 +1061,9 @@ def load_data(file_path, _mtime, site_type="freestanding"):
             _use_e  = out["faulty_replaced"] & (_repl_e.str.len() > 0)
             out.loc[_use_e, "old_serial"] = out.loc[_use_e, "serial"]
             out.loc[_use_e, "serial"]     = _repl_e[_use_e]
+        out["handover_date"]   = pd.to_datetime(coalesce_col(edf, ["Handover Date"]), errors="coerce")
+        out["closing_reading"] = coalesce_col(edf, ["Closing Reading"]).apply(
+            lambda v: str(v).strip() if pd.notna(v) and str(v).strip() not in ("", "nan", "None") else "")
         out["meter_type"] = "Electrical"
         out = out[out["stand"].notna() & (out["stand"] != "") & (out["stand"].str.lower() != "none")]
         records.append(out)
@@ -1133,6 +1139,8 @@ def _load_apartment_data(xls):
             out["eb_port"] = edf[_eb_col_a].apply(_fmt_port_a)
         else:
             out["eb_port"] = ""
+        out["handover_date"]  = pd.NaT
+        out["closing_reading"]= ""
         out["meter_type"]     = "Electrical"
         out["installed"]      = out["serial"].str.len().gt(0) & out["serial"].ne("nan")
         out = out[out["stand"].notna() & (out["stand"] != "") & (out["stand"].str.lower() != "nan")]
@@ -1164,6 +1172,8 @@ def _load_apartment_data(xls):
             out["old_serial"]      = ""
             out["replacement_date"]= pd.NaT
             out["eb_port"]         = ""
+            out["handover_date"]   = pd.NaT
+            out["closing_reading"] = ""
             out["meter_type"]      = meter_subtype
             out["installed"]       = out["serial"].str.len().gt(0) & out["serial"].ne("nan")
             out = out[out["stand"].notna() & (out["stand"] != "") & (out["stand"].str.lower() != "nan")]
@@ -2276,13 +2286,13 @@ if _qp_stand:
 WORKSPACES = {
     "🏘️ Estate Management": ["Outstanding", "Upcoming", "Overdue", "Installed",
                               "Calendar", "Sections", "Reticulation",
-                              "Faulty Meters", "Stock"],
+                              "Faulty Meters", "Handover", "Stock"],
     "📊 Meter Management":  ["Estate Map", "AMR Live", "Balancing"],
 }
 _PAGE_ICONS = {
     "Outstanding": "🟦", "Upcoming": "🟧", "Overdue": "🟥", "Installed": "🟩",
     "Calendar": "📅", "Sections": "📊", "Reticulation": "⚡",
-    "Faulty Meters": "⚠️", "Stock": "📦",
+    "Faulty Meters": "⚠️", "Stock": "📦", "Handover": "🤝",
     "Estate Map": "🗺️", "AMR Live": "📡", "Balancing": "⚖️",
 }
 
@@ -2360,7 +2370,7 @@ st.divider()
 
 # ---------- Page banner (navigation lives in the left sidebar) ----------
 _FS_ONLY_PAGES = {"Outstanding", "Upcoming", "Overdue", "Calendar", "Sections",
-                  "Faulty Meters", "Stock", "Estate Map"}
+                  "Faulty Meters", "Stock", "Handover", "Estate Map"}
 st.markdown(f"### {_PAGE_ICONS.get(_PAGE, '')} {_PAGE}")
 if is_apartments and _PAGE in _FS_ONLY_PAGES:
     st.info(f"**{_PAGE}** applies to the freestanding project (apartments have no "
@@ -3197,12 +3207,28 @@ if _PAGE == "Estate Map" and not is_apartments:
                     "⚠️ Highlight faulty meters", value=False, key="map_faulty_mode",
                     help="Switch polygon colours to show fault status: red = faulty awaiting replacement, purple = replaced, dark = no fault."
                 )
+                handover_only = st.checkbox(
+                    "🤝 Show handed-over stands only", value=False, key="map_handover_only",
+                    help="Filter the map to stands with a Handover Date recorded."
+                )
 
             map_df = df.copy()
             if map_meter_type == "Electrical only":
                 map_df = df[df["meter_type"] == "Electrical"]
             elif map_meter_type == "Water only":
                 map_df = df[df["meter_type"] == "Water"]
+
+            # Restrict to handed-over stands if requested
+            _handed_stands = set()
+            if "handover_date" in df.columns:
+                _handed_stands = set(df[df["handover_date"].notna()]["stand"].astype(str))
+            if handover_only:
+                if _handed_stands:
+                    map_df = map_df[map_df["stand"].astype(str).isin(_handed_stands)]
+                    polygons = [p for p in polygons if p["name"].strip() in _handed_stands]
+                    st.caption(f"🤝 Showing **{len(_handed_stands)}** handed-over stand(s) only.")
+                else:
+                    st.info("No stands have a Handover Date yet — showing all stands.")
 
             # ── Legend ──────────────────────────────────────────────────
             if faulty_mode:
@@ -4709,6 +4735,116 @@ if _PAGE == "AMR Live" and is_apartments:
 # =====================================================================
 # STOCK TAB — inventory tracking with auto-deduction (freestanding)
 # =====================================================================
+if _PAGE == "Handover" and not is_apartments:
+    st.subheader("🤝 Unit Handover to Estate — Evergreen Property Investments")
+    st.caption(
+        "Units handed over from the builder to the estate, with the handover date and the closing "
+        "water & electricity readings on that date. Maintained from the spreadsheet's Handover Date "
+        "and Closing Reading columns. Download the table to keep the builder and our team aligned."
+    )
+
+    # Pivot elec + water onto one row per handed-over stand
+    ho = df[df["handover_date"].notna()].copy() if "handover_date" in df.columns else df.iloc[0:0]
+    if ho.empty:
+        st.info("No handed-over units yet. Populate the **Handover Date** column in the spreadsheet "
+                "(FS Elec / FS Water) and they'll appear here automatically.")
+    else:
+        elec = ho[ho["meter_type"] == "Electrical"].set_index("stand")
+        water = ho[ho["meter_type"] == "Water"].set_index("stand")
+        stands = sorted(set(elec.index) | set(water.index),
+                        key=lambda s: (len(str(s)), str(s)))
+
+        def _cr(frame, stand):
+            if stand in frame.index:
+                v = frame.loc[stand, "closing_reading"]
+                if isinstance(v, pd.Series):
+                    v = v.iloc[0]
+                return str(v) if v else ""
+            return ""
+        def _hd(stand):
+            for frame in (elec, water):
+                if stand in frame.index:
+                    d = frame.loc[stand, "handover_date"]
+                    if isinstance(d, pd.Series):
+                        d = d.iloc[0]
+                    if pd.notna(d):
+                        return pd.Timestamp(d)
+            return pd.NaT
+        def _sec(stand):
+            for frame in (elec, water):
+                if stand in frame.index and "wbho_section" in frame.columns:
+                    s = frame.loc[stand, "wbho_section"]
+                    if isinstance(s, pd.Series):
+                        s = s.iloc[0]
+                    if pd.notna(s) and str(s).strip():
+                        return str(s).strip()
+            return ""
+
+        rows = []
+        for s in stands:
+            hd = _hd(s)
+            e_cr = _cr(elec, s)
+            w_cr = _cr(water, s)
+            rows.append({
+                "Stand": s,
+                "Section": _sec(s),
+                "Handover Date": hd.strftime("%d %b %Y") if pd.notna(hd) else "",
+                "Elec Closing Reading (kWh)": e_cr,
+                "Water Closing Reading (kL)": w_cr,
+                "Elec Reading Status": "⏳ TBC" if e_cr.upper() == "TBC" else ("✅ Captured" if e_cr else "— none"),
+                "Water Reading Status": "⏳ TBC" if w_cr.upper() == "TBC" else ("✅ Captured" if w_cr else "— none"),
+                "_hd_sort": hd,
+            })
+        ho_df = pd.DataFrame(rows).sort_values(["_hd_sort", "Stand"]).drop(columns="_hd_sort")
+
+        # KPIs
+        _n = len(ho_df)
+        _tbc = int((ho_df["Elec Closing Reading (kWh)"].str.upper() == "TBC").sum()
+                   + (ho_df["Water Closing Reading (kL)"].str.upper() == "TBC").sum())
+        _fs_total = len(df[df["meter_type"] == "Electrical"]["stand"].unique())
+        metric_row([
+            ("🤝 Units handed over", _n, f"of {_fs_total} freestanding"),
+            ("📅 Handover dates", ho_df["Handover Date"].replace("", pd.NA).nunique()),
+            ("⏳ Readings TBC", _tbc, "awaiting capture", "off"),
+            ("✅ Fully captured",
+             int(((ho_df["Elec Closing Reading (kWh)"].str.upper() != "TBC") & (ho_df["Elec Closing Reading (kWh)"] != "")
+                  & (ho_df["Water Closing Reading (kL)"].str.upper() != "TBC") & (ho_df["Water Closing Reading (kL)"] != "")).sum())),
+        ], desktop_cols=4)
+
+        if _tbc:
+            st.warning(f"⏳ **{_tbc} closing reading(s)** still marked TBC — these will be captured and, "
+                       "where noted, estimated to the 31 July handover date.")
+
+        st.divider()
+        st.markdown("##### Handover register")
+        st.dataframe(ho_df, width='stretch', hide_index=True,
+                     height=min(560, 90 + 35 * len(ho_df)))
+
+        # Excel download — real .xlsx, formatted
+        import io as _io
+        _buf = _io.BytesIO()
+        with pd.ExcelWriter(_buf, engine="openpyxl") as _xw:
+            _out = ho_df.copy()
+            _out.to_excel(_xw, index=False, sheet_name="Handover Register")
+            _ws = _xw.sheets["Handover Register"]
+            for _i, _col in enumerate(_out.columns, start=1):
+                _w = max(len(str(_col)), *(len(str(v)) for v in _out[_col])) + 3
+                _ws.column_dimensions[_ws.cell(row=1, column=_i).column_letter].width = min(_w, 40)
+            from openpyxl.styles import Font as _F, PatternFill as _PF
+            for _c in _ws[1]:
+                _c.font = _F(bold=True, color="FFFFFF")
+                _c.fill = _PF("solid", fgColor="1F5C4D")
+        _buf.seek(0)
+        _fname = f"Sitari_Handover_Register_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        st.download_button("⬇️ Download handover register (Excel)", _buf.getvalue(),
+                           file_name=_fname,
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="ho_xlsx_dl")
+        st.caption("Table reflects the spreadsheet's Handover Date and Closing Reading columns — "
+                   "update those and this register (and the Excel export) update automatically. "
+                   "'TBC' readings are carried through verbatim so both teams can see what's outstanding.")
+
+
 if _PAGE == "Stock" and not is_apartments:
     st.subheader("📦 Stock on Hand — Freestanding Project")
     st.caption(
